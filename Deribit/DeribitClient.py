@@ -259,13 +259,41 @@ class DeribitClient:
         except Exception as e:
             logger.error(f"Error getting positions: {e}")
             return None
+        
+    # Get Order Book Information
+    async def get_order_book(self, instrument_name: str, depth: int):
+        if not self.websocket or not self._is_ws_connected(self.websocket):
+            logger.error("WebSocket is not connected. Cannot get order book.")
+            return
+        if depth <= 0:
+            logger.error("Depth must be greater than 0.")
+            return
+        
+        request_id = self._generate_request_id()
+        get_order_book_msg = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "public/get_order_book",
+            "params": {
+                "instrument_name": instrument_name,
+                "depth": depth
+            }
+        }
+        try:
+            await self.websocket.send(json.dumps(get_order_book_msg))
+            response = await self.websocket.recv()
+            logger.info(f"Get order book response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error getting order book: {e}")
+            return None
 
 # async def main():
 #     client = DeribitClient()
 #     connect_task = asyncio.create_task(client.connect())
 #     await asyncio.sleep(3)
 
-#     await client.get_positions("ETH", "future")
+#     await client.get_order_book("BTC-PERPETUAL", 1)
 
 #     await client.disconnect()
 #     await connect_task
