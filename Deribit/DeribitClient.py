@@ -115,6 +115,30 @@ class DeribitClient:
         else: 
             logger.error("No WebSocket connection to close.")
 
+    # Get Ticker Information
+    async def ticker(self, instrument_name: str):
+        if not self.websocket or not self._is_ws_connected(self.websocket):
+            logger.error("WebSocket is not connected. Cannot get ticker.")
+            return
+        
+        request_id = self._generate_request_id()
+        ticker_msg = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "public/ticker",
+            "params": {
+                "instrument_name": instrument_name
+            }
+        }
+        try:
+            await self.websocket.send(json.dumps(ticker_msg))
+            response = await self.websocket.recv()
+            logger.info(f"Ticker response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error getting ticker: {e}")
+            return None
+
     # Send Order
     async def send_order(self, side, order_type, instrument_name, price, amount):
         if side not in ["buy", "sell"]:
@@ -293,7 +317,7 @@ class DeribitClient:
 #     connect_task = asyncio.create_task(client.connect())
 #     await asyncio.sleep(3)
 
-#     await client.get_order_book("BTC-PERPETUAL", 1)
+#     await client.ticker("BTC-PERPETUAL")
 
 #     await client.disconnect()
 #     await connect_task
