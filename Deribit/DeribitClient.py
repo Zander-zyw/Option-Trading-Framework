@@ -116,12 +116,77 @@ class DeribitClient:
             logger.error("No WebSocket connection to close.")
 
     # Send Order
-    def send_order(self):
-        pass
+    async def send_order(self, side, order_type, instrument_name, price, amount):
+        if side not in ["buy", "sell"]:
+            logger.error("Invalid order side. Must be 'buy' or 'sell'.")
+            return
+        if order_type not in ["limit", "market"]:
+            logger.error("Invalid order type. Must be 'limit' or 'market'.")
+            return
+        if order_type == 'limit' and not isinstance(price, (int, float)):
+            logger.error("Price must be a number.")
+            return
+        if not isinstance(amount, (int, float)):
+            logger.error("Amount must be a number.")
+            return
+        if not self.websocket or not self._is_ws_connected(self.websocket):
+            logger.error("WebSocket is not connected. Cannot send order.")
+            return
+        
+        # Order message
+        request_id = self._generate_request_id()
+        order_msg = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": f"private/{side}",
+            "params": {
+                "instrument_name": instrument_name,
+                "amount": amount,
+                "type": order_type,
+                "label": f"{side}_{order_type}_{price}_{amount}_{request_id}",
+            }
+        }
+
+        # Add price for limit orders
+        if order_type == 'limit':
+            order_msg["params"]["price"] = price
+
+        # Send the order message
+        logger.info(f"Sending order message: {order_msg}")
+        try:
+            await self.websocket.send(json.dumps(order_msg))
+            response = await self.websocket.recv()
+            logger.info(f"Order response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error sending order message: {e}")
+            return None
     
     # Cancel Order
-    def cancel_order(self):
-        pass
+    async def cancel_order(self, order_id: str):
+        if not self.websocket or not self._is_ws_connected(self.websocket):
+            logger.error("WebSocket is not connected. Cannot cancel order.")
+            return
+        
+        request_id = self._generate_request_id()
+        cancel_msg = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "private/cancel",
+            "params": {
+                "order_id": order_id
+            }
+        }
+        try:
+            await self.websocket.send(json.dumps(cancel_msg))
+            logger.info(f"Cancel order request sent: {cancel_msg}")
+            response = await self.websocket.recv()
+            response = json.loads(response)
+            logger.info(f"Cancel order response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error sending cancel order request: {e}")
+            return None
 
     # Subscribe
     async def subscribe(self, channels):
