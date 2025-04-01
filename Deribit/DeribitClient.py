@@ -235,18 +235,37 @@ class DeribitClient:
         except Exception as e:
             logger.error(f"Error sending unsubscribe message: {e}")
 
-    # Get Position
-    def get_position(self):
-        pass
+    # Get Positions
+    async def get_positions(self, currency, kind):
+        if not self.websocket or not self._is_ws_connected(self.websocket):
+            logger.error("WebSocket is not connected. Cannot get positions.")
+            return
+        
+        request_id = self._generate_request_id()
+        get_positions_msg = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "private/get_positions",
+            "params": {
+                "currency": currency,
+                "kind": kind
+            }
+        }
+        try:
+            await self.websocket.send(json.dumps(get_positions_msg))
+            response = await self.websocket.recv()
+            logger.info(f"Get positions response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error getting positions: {e}")
+            return None
 
 # async def main():
 #     client = DeribitClient()
 #     connect_task = asyncio.create_task(client.connect())
 #     await asyncio.sleep(3)
 
-#     await client.subscribe(["ticker.BTC-PERPETUAL.raw"])
-#     await asyncio.sleep(10)
-#     await client.unsubscribe(["ticker.BTC-PERPETUAL.raw"])
+#     await client.get_positions("ETH", "future")
 
 #     await client.disconnect()
 #     await connect_task
