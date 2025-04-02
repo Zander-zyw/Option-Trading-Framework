@@ -16,9 +16,9 @@ class StraddleClient(DeribitClient):
     def __init__(self, symbol):
         super().__init__()
         self.symbol = symbol
-        
+    
+    # get the next expiry date for the given symbol
     def _get_next_expiry(self):
-        # Implement logic to get the next expiry date for the given symbol
         today = datetime.now(timezone.utc)
         days_until_friday = (4 - today.weekday()) % 7  # friday is 4
         if days_until_friday == 0: # today is Friday
@@ -84,7 +84,8 @@ class StraddleClient(DeribitClient):
         else:
             logger.error("Failed to get instruments")
             return None, None
-        
+    
+    # Main Logic to execute the straddle strategy
     async def execute_straddle(self):
         await self.connect()
 
@@ -103,7 +104,7 @@ class StraddleClient(DeribitClient):
             # ===================================================================
             # == Execute the straddle strategy here (buy call and put options) ==
             # ===================================================================
-            
+
         else:
             logger.error("No suitable options found for straddle strategy")
             return
