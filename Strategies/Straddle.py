@@ -35,7 +35,7 @@ class StraddleClient(DeribitClient):
         # Calculate next Friday
         days_until_friday = (4 - now.weekday()) % 7  # Friday is the 4th day of the week
         next_friday = now.date() + timedelta(days=days_until_friday)
-        execution_time = datetime.combine(next_friday, time(0, 30), timezone.utc)
+        execution_time = datetime.combine(next_friday, time(8, 30), timezone.utc)
 
         # If current time is past this week's Friday 8:00 UTC, move to the next week
         if now >= execution_time:
@@ -84,6 +84,16 @@ class StraddleClient(DeribitClient):
         else:
             logger.error("Failed to get instruments")
             return None, None
+        
+    async def get_order_book(self, instrument_name, depth):
+        response = await super().get_order_book(instrument_name, depth)
+
+        best_ask = response["result"]["best_ask_price"]
+        best_bid = response["result"]["best_bid_price"]
+        logger.info(f"Best ask price for {instrument_name}: {best_ask}")
+        logger.info(f"Best bid price for {instrument_name}: {best_bid}")
+
+        return best_ask, best_bid
     
     # Main Logic to execute the straddle strategy
     async def execute_straddle(self):
@@ -93,21 +103,29 @@ class StraddleClient(DeribitClient):
         instrument_name = f"{self.symbol}-{self._get_next_expiry().strftime('%-d%b%y').upper()}"
         mark_price = await self.ticker(instrument_name=instrument_name)
 
+        # if mark price is None, exit
+        if not mark_price:
+            return
+
         call_options, put_options = await self.get_instruments(currency="BTC", kind="option")
 
         # Straddle strategy (strike price is the same for both call and put, and strike > mark price)
         call_option = next((option for option in call_options if option['strike'] > mark_price), None)
         put_option = next((option for option in put_options if option['strike'] > mark_price), None)
-        if call_option and put_option:
-            logger.info(f"Call option: {call_option['instrument_name']}, Put option: {put_option['instrument_name']}")
 
-            # ===================================================================
-            # == Execute the straddle strategy here (buy call and put options) ==
-            # ===================================================================
-
-        else:
+        if not call_option or not put_option:
             logger.error("No suitable options found for straddle strategy")
             return
+
+        logger.info(f"Call option: {call_option['instrument_name']}, Put option: {put_option['instrument_name']}")
+
+        # Get the order book for both options
+        call_best_ask, call_best_bid = await self.get_order_book(call_option['instrument_name'], 5)
+        put_best_ask, put_best_bid = await self.get_order_book(put_option['instrument_name'], 5)
+
+        # ===================================================================
+        # == Execute the straddle strategy here (buy call and put options) ==
+        # ===================================================================
         
         await self.disconnect()
 

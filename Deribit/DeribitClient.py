@@ -255,12 +255,9 @@ class DeribitClient:
             return None
 
     # Subscribe
-    async def subscribe(self, channels):
+    async def subscribe(self, channels: list):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot subscribe.")
-            return
-        if not isinstance(channels, list):
-            logger.error("Channels must be a list.")
             return
         
         subscribe_msg = {
