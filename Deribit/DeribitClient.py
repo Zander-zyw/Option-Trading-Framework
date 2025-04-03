@@ -6,7 +6,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
 
 from Logger.Logger import logger
-### import DeribitClient ###
+### import Logger ###
 
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime
@@ -347,6 +347,30 @@ class DeribitClient:
             return response
         except Exception as e:
             logger.error(f"Error getting order book: {e}")
+            return None
+
+    # Get Order State
+    async def get_order_state(self, order_id: str):
+        if not self.websocket or not self._is_ws_connected(self.websocket):
+            logger.error("WebSocket is not connected. Cannot get order book.")
+            return
+
+        request_id = self._generate_request_id()
+        state_request = {
+            "jsonrpc" : "2.0",
+            "id" : request_id,
+            "method" : "private/get_order_state",
+            "params" : {
+                "order_id" : order_id
+            }
+        }
+
+        try:
+            response = await self.send_request(state_request)
+            logger.info(f"Get order state response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error getting order state: {e}")
             return None
 
     async def disconnect(self):
