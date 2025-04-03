@@ -1,7 +1,0 @@
-[2025-04-03 16:51:52,171] INFO: WebSocket connection established.
-[2025-04-03 16:51:52,482] INFO: Authentication successful.
-[2025-04-03 16:51:52,484] INFO: Read loop started.
-[2025-04-03 16:51:52,788] INFO: Mark price for BTC-4APR25: 83593.82
-[2025-04-03 16:51:53,458] INFO: Get order book response: {'jsonrpc': '2.0', 'id': 1743670313156, 'result': {'timestamp': 1743670312597, 'state': 'open', 'stats': {'high': 0.053, 'low': 0.007, 'price_change': -62.7451, 'volume': 162.9, 'volume_usd': 160127.24}, 'greeks': {'delta': 0.43962, 'gamma': 0.00016, 'vega': 16.94102, 'theta': -479.9221, 'rho': 0.94979}, 'change_id': 95389243172, 'index_price': 83585.93, 'instrument_name': 'BTC-4APR25-84000-C', 'bids': [[0.009, 19.2]], 'asks': [[0.01, 36.6]], 'last_price': 0.0095, 'settlement_price': 0.00922141, 'min_price': 0.0001, 'max_price': 0.0415, 'open_interest': 270.5, 'mark_price': 0.0094, 'best_ask_price': 0.01, 'best_bid_price': 0.009, 'interest_rate': 0.0, 'mark_iv': 56.66, 'bid_iv': 54.81, 'ask_iv': 59.74, 'underlying_price': 83593.82, 'underlying_index': 'BTC-4APR25', 'estimated_delivery_price': 83585.93, 'best_ask_amount': 36.6, 'best_bid_amount': 19.2}, 'usIn': 1743670313310696, 'usOut': 1743670313310978, 'usDiff': 282, 'testnet': False}
-[2025-04-03 16:51:53,458] INFO: Mark IV for BTC-4APR25-84000-C: 56.66
-[2025-04-03 16:51:53,459] INFO: Call1 IV 56.66 is below threshold 60, not executing cover call

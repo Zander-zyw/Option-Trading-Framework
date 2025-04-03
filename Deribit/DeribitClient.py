@@ -380,19 +380,3 @@ class DeribitClient:
             logger.info("WebSocket connection closed manually.")
         else: 
             logger.error("No WebSocket connection to close.")
-
-
-# async def main():
-#     client = DeribitClient()
-#     await client.connect()
-#     await asyncio.sleep(3)
-
-#     await client.subscribe(["deribit_price_index.btc_usd"])
-#     await asyncio.sleep(3)
-#     await client.unsubscribe(["deribit_price_index.btc_usd"])
-
-#     await asyncio.sleep(3)
-#     await client.disconnect()
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
