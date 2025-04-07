@@ -31,12 +31,12 @@ class DeribitClient:
         self.is_running = True
         self.pending_requests = {}  # 用于存储等待响应的 Future
 
-    # Generate ID for Requests
+    # == Generate ID for Requests ==
     def _generate_request_id(self):
         req_id = int(datetime.now().timestamp() * 1000)
         return req_id
 
-    # Generate Authentication Message
+    # == Generate Authentication Message ==
     def _generate_auth_msg(self):
         timestamp = round(datetime.now().timestamp() * 1000)
         nonce = "abcd"
@@ -58,7 +58,7 @@ class DeribitClient:
         }
         return auth_msg
 
-    # Check Websocket Connection
+    # == Check Websocket Connection ==
     def _is_ws_connected(self, websocket):
         if websocket.state == websockets.protocol.State.OPEN:
             return True
@@ -72,6 +72,7 @@ class DeribitClient:
             logger.error("WebSocket connection is not established.")
             return False
 
+    # == Read Loop ==
     async def _read_loop(self):
         """
         统一读取循环：只在这里调用 websocket.recv()，并将响应分发到对应的 Future 中。
@@ -97,6 +98,7 @@ class DeribitClient:
                 logger.error(f"Error in read loop: {e}")
                 break
 
+    # == Connect ==
     async def connect(self):
         """
         1. Connect to WebSocket
@@ -136,7 +138,7 @@ class DeribitClient:
         response = await future
         return response
 
-    # Get Ticker Information
+    # == Get Ticker Information ==
     async def ticker(self, instrument_name: str):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot get ticker.")
@@ -158,7 +160,7 @@ class DeribitClient:
             logger.error(f"Error getting ticker: {e}")
             return None
 
-    # Get Instrument Information
+    # == Get Instrument Information ==
     async def get_instruments(self, currency: str, kind: str):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot get instruments.")
@@ -182,7 +184,7 @@ class DeribitClient:
             logger.error(f"Error getting instruments: {e}")
             return None
 
-    # Send Order
+    # == Send Order ==
     async def send_order(self, side, order_type, instrument_name, price, amount):
         if side not in ["buy", "sell"]:
             logger.error("Invalid order side. Must be 'buy' or 'sell'.")
@@ -229,7 +231,7 @@ class DeribitClient:
             logger.error(f"Error sending order message: {e}")
             return None
     
-    # Cancel Order
+    # == Cancel Order ==
     async def cancel_order(self, order_id: str):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot cancel order.")
@@ -254,7 +256,7 @@ class DeribitClient:
             logger.error(f"Error sending cancel order request: {e}")
             return None
 
-    # Subscribe
+    # == Subscribe ==
     async def subscribe(self, channels: list):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot subscribe.")
@@ -274,7 +276,7 @@ class DeribitClient:
         except Exception as e:
             logger.error(f"Error sending subscribe message: {e}")
 
-    # Unsubscribe
+    # == Unsubscribe ==
     async def unsubscribe(self, channels):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot unsubscribe.")
@@ -298,7 +300,32 @@ class DeribitClient:
         except Exception as e:
             logger.error(f"Error sending unsubscribe message: {e}")
 
-    # Get Positions
+    # == Get Account Information ==
+    async def get_account_summary(self, currency, extended=True):
+        if not self.websocket or not self._is_ws_connected(self.websocket):
+            logger.error("WebSocket is not connected. Cannot get account info.")
+            return
+
+        request_id = self._generate_request_id()
+        get_account_summary_msg = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "private/get_account_summary",
+            "params": {
+                "currency": currency,
+                "extended": extended
+            }
+        }
+
+        try:
+            response = await self.send_request(get_account_summary_msg)
+            logger.info(f"Get account summary response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error getting account summary: {e}")
+            return None
+
+    # == Get Positions ==
     async def get_positions(self, currency, kind):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot get positions.")
@@ -321,8 +348,32 @@ class DeribitClient:
         except Exception as e:
             logger.error(f"Error getting positions: {e}")
             return None
+
+    # == Get Position By Instrument Name ==
+    async def get_position_by_instrument_name(self, instrument_name: str):
+        if not self.websocket or not self._is_ws_connected(self.websocket):
+            logger.error("WebSocket is not connected. Cannot get position by instrument name.")
+            return
+
+        request_id = self._generate_request_id()
+        get_position_by_instrument_name_msg = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "private/get_position",
+            "params": {
+                "instrument_name": instrument_name
+            }
+        }
+
+        try:
+            response = await self.send_request(get_position_by_instrument_name_msg)
+            logger.info(f"Get position by instrument name response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error getting position by instrument name: {e}")
+            return None
         
-    # Get Order Book Information
+    # == Get Order Book Information ==
     async def get_order_book(self, instrument_name: str, depth: int):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot get order book.")
@@ -349,7 +400,7 @@ class DeribitClient:
             logger.error(f"Error getting order book: {e}")
             return None
 
-    # Get Order State
+    # == Get Order State ==
     async def get_order_state(self, order_id: str):
         if not self.websocket or not self._is_ws_connected(self.websocket):
             logger.error("WebSocket is not connected. Cannot get order book.")
@@ -373,6 +424,7 @@ class DeribitClient:
             logger.error(f"Error getting order state: {e}")
             return None
 
+    # == Disconnect ==
     async def disconnect(self):
         self.is_running = False
         if self.websocket and self._is_ws_connected(self.websocket):
@@ -380,3 +432,13 @@ class DeribitClient:
             logger.info("WebSocket connection closed manually.")
         else: 
             logger.error("No WebSocket connection to close.")
+
+# example main for get_position_by_instrument_name
+async def main():
+    client = DeribitClient()
+    await client.connect()
+    await client.get_positions("ETH", "option")
+    await client.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())

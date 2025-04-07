@@ -1,6 +1,11 @@
 ### import DeribitClient ###
 import sys
 import os
+import signal
+import json
+import asyncio
+from datetime import datetime, timedelta, timezone, time
+import math
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
@@ -9,14 +14,80 @@ from Deribit.DeribitClient import DeribitClient
 from Logger.Logger import logger
 ### import DeribitClient ###
 
-from datetime import datetime, timedelta, timezone, time
-import asyncio
-
 class CoverCallClient(DeribitClient):
-    def __init__(self, symbol, iv_threshold):
+    def __init__(self, symbol, position_thresholds, stop_loss_multiplier):
         super().__init__()
         self.symbol = symbol
-        self.iv_threshold = iv_threshold
+        self.position_thresholds = position_thresholds
+        self.stop_loss_multiplier = stop_loss_multiplier
+        self.is_running = True
+        self.active_positions = {}  # Track active positions and their entry prices
+        self.position_monitor = None
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        if sys.platform != 'win32':  # Windows doesn't support SIGINT properly
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        self.is_running = False
+
+    async def save_state(self):
+        """Save current state to file"""
+        try:
+            state = {
+                'active_positions': self.active_positions,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }
+            
+            state_file = os.path.join(BASE_DIR, 'state', f'cover_call_state_{self.symbol}.json')
+            os.makedirs(os.path.dirname(state_file), exist_ok=True)
+            
+            with open(state_file, 'w') as f:
+                json.dump(state, f, indent=4)
+            
+            logger.info(f"State saved to {state_file}")
+        except Exception as e:
+            logger.error(f"Failed to save state: {str(e)}")
+
+    async def load_state(self):
+        """Load saved state from file"""
+        try:
+            state_file = os.path.join(BASE_DIR, 'state', f'cover_call_state_{self.symbol}.json')
+            if os.path.exists(state_file):
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                    self.active_positions = state.get('active_positions', {})
+                    logger.info(f"Loaded {len(self.active_positions)} positions from state file")
+        except Exception as e:
+            logger.error(f"Failed to load state: {str(e)}")
+
+    async def shutdown(self):
+        """Graceful shutdown procedure"""
+        logger.info("Starting shutdown procedure...")
+        
+        # Stop the main loop
+        self.is_running = False
+        
+        # Cancel position monitoring task if it exists
+        if self.position_monitor:
+            self.position_monitor.cancel()
+            try:
+                await self.position_monitor
+            except asyncio.CancelledError:
+                pass
+        
+        # Save current state
+        await self.save_state()
+        
+        # Disconnect from exchange
+        await self.disconnect()
+        
+        logger.info("Shutdown completed")
 
     # Get the next expiry date for the given symbol
     def _get_next_expiry(self):
@@ -51,7 +122,7 @@ class CoverCallClient(DeribitClient):
                 _, best_bid = await self.get_order_book(order_name)
                 order_id = await self.send_order(side="sell", order_type="limit", instrument_name=order_name, price=best_bid, amount=remaining_call)
             
-            asyncio.sleep(60)
+            await asyncio.sleep(60)
     
     # Get the mark price for the next expiry date
     async def ticker(self, instrument_name: str):
@@ -115,56 +186,227 @@ class CoverCallClient(DeribitClient):
         logger.info(f"Best bid price for {instrument_name}: {best_bid}")
 
         return best_ask, best_bid
+
+    async def get_account_summary(self, currency, extended=True):
+        response = await super().get_account_summary(currency, extended)
+
+        if response:
+            return response["result"]["equity"]
+        else:
+            return None
+
+    async def get_positions(self, currency, kind):
+        response = await super().get_positions(currency, kind)
+
+        if response:
+            total_positions = sum(abs(float(position["result"]["amount"])) for position in response["result"])
+            logger.info(f"Total positions: {total_positions}")
+            return total_positions
+        else:
+            return None
+
+    async def get_position_by_instrument_name(self, instrument_name):
+        response = await super().get_position_by_instrument_name(instrument_name)
+
+        if response:
+            return response["result"]["settlement_price"], response["result"]["size"]
+        else:
+            return None
     
     async def get_order_state(self, order_id):
         response = await super().get_order_state(order_id)
 
         return response["result"]["amount"] - response["result"]["filled_amount"]
+
+    async def calculate_target_position(self, current_iv, current_position, equity):
+        target_leverage = 0
+        for threshold, leverage in sorted(self.position_thresholds.items()):
+            if current_iv >= threshold and leverage > target_leverage:
+                target_leverage = leverage
         
-    async def execute_covercall(self):
+        if target_leverage == 0:
+            return 0
+        
+        # 如果当前仓位已经达到或超过目标杠杆，不增加仓位
+        current_leverage = abs(current_position) / equity if equity > 0 else 0
+        if current_leverage >= target_leverage:
+            logger.info(f"Current leverage {current_leverage} already meets or exceeds target {target_leverage}")
+            return 0
+        
+        # 计算需要增加的仓位
+        target_position = equity * target_leverage
+        position_to_add = target_position - abs(current_position)
+
+        # 取到0.1的倍数
+        position_to_add = math.floor(position_to_add / 0.1) * 0.1
+        
+        return position_to_add
+
+    async def monitor_positions(self):
+        while self.is_running:
+            try:
+                # Only monitor positions this strategy opened
+                for instrument_name, position_info in list(self.active_positions.items()):
+                    try:
+                        # Get current mark price
+                        mark_price = await self.ticker(instrument_name)
+                        
+                        if mark_price:
+                            # Get settlement price from position info
+                            settlement_price = position_info["entry_price"]
+                            
+                            # Calculate stop loss price (stop_loss_multiplier * settlement price)
+                            stop_loss_price = settlement_price * self.stop_loss_multiplier
+                            
+                            logger.info(f"Position: {instrument_name}, Amount: {position_info['amount']}, Mark Price: {mark_price}, Stop Loss: {stop_loss_price}")
+                            
+                            # Check if we need to close position
+                            if mark_price >= stop_loss_price:
+                                logger.warning(f"Stop loss triggered for {instrument_name} at mark price {mark_price}")
+                                
+                                # Close position (we know it's a short position)
+                                best_ask, _ = await self.get_order_book(instrument_name, 1)
+                                
+                                # Send close order
+                                order_id = await self.send_order(
+                                    side="buy",  # Close short position
+                                    order_type="limit",
+                                    instrument_name=instrument_name,
+                                    price=best_ask,
+                                    amount=position_info["amount"]
+                                )
+                                
+                                if order_id:
+                                    await self._wait_order_fill(order_id, instrument_name)
+                                    logger.info(f"Position closed for {instrument_name}")
+                                    
+                                    # Remove from active positions
+                                    del self.active_positions[instrument_name]
+                    
+                    except Exception as e:
+                        logger.error(f"Error monitoring position {instrument_name}: {str(e)}")
+                        continue
+                
+                await asyncio.sleep(60)  # Check positions every 60 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in position monitoring: {str(e)}")
+                await asyncio.sleep(60)
+
+    async def execute(self):
         await self.connect()
-
-        # Get the mark price for the next expiry date
-        instrument_name = f"{self.symbol}-{self._get_next_expiry().strftime('%-d%b%y').upper()}"
-        mark_price = await self.ticker(instrument_name=instrument_name)
-
-        # if mark price is None, exit
-        if not mark_price:
-            return
         
-        call_options = await self.get_instruments(currency="BTC", kind="option")
-
-        # Straddle strategy (strike price is the same for both call and put, and strike > mark price)
-        call1 = next((option for option in call_options if option['strike'] > mark_price), None)      
-
-        if not call1:
-            logger.error("No suitable options found for cover call strategy")
-            return
+        # Load previous state
+        await self.load_state()
         
-        call1_iv = await self.get_call1_iv(call1['instrument_name'])
-
-        if call1_iv is None:
-            return
-        elif call1_iv < self.iv_threshold:
-            logger.info(f"Call1 IV {call1_iv} is below threshold {self.iv_threshold}, not executing cover call")
-            return            
+        # Start position monitoring in background
+        self.position_monitor = asyncio.create_task(self.monitor_positions())
         
-        call_price = mark_price * 1.05
-        call_option = next((option for option in call_options if option['strike'] > call_price), None)
-        best_ask_price, best_bid_price = await self.get_order_book(call_option['instrument_name'], 1)
+        try:
+            while self.is_running:
+                try:
+                    # Get account equity
+                    equity = await self.get_account_summary(currency=self.symbol)
+                    if not equity:
+                        logger.error("Failed to get account equity")
+                        await asyncio.sleep(60)
+                        continue
 
-        # =====================================================================
-        # == Execute the cover call strategy here (buy call and put options) ==
-        # =====================================================================
+                    # Get current positions
+                    current_position = await self.get_positions(currency=self.symbol, kind="option")
+                    if current_position is None:
+                        logger.error("Failed to get current positions")
+                        await asyncio.sleep(60)
+                        continue
 
-        # order_id = await self.send_order(side="sell", order_type="limit", instrument_name=call_option["instrument_name"], price=best_ask_price, amount=0.1)
-        # await self._wait_order_fill(order_id)
+                    # Get the mark price for the next expiry date
+                    instrument_name = f"{self.symbol}-{self._get_next_expiry().strftime('%-d%b%y').upper()}"
+                    mark_price = await self.ticker(instrument_name=instrument_name)
 
-        await self.disconnect()
+                    if not mark_price:
+                        await asyncio.sleep(60)
+                        continue
+                    
+                    call_options = await self.get_instruments(currency="BTC", kind="option")
+                    if not call_options:
+                        await asyncio.sleep(60)
+                        continue
+
+                    # Find the first call option with strike price above mark price
+                    call1 = next((option for option in call_options if option['strike'] > mark_price), None)      
+
+                    if not call1:
+                        logger.error("No suitable options found for cover call strategy")
+                        await asyncio.sleep(60)
+                        continue
+                    
+                    call1_iv = await self.get_call1_iv(call1['instrument_name'])
+
+                    if call1_iv is None:
+                        await asyncio.sleep(60)
+                        continue
+                    
+                    logger.info(f"Current IV: {call1_iv}, Current Position: {current_position}, Equity: {equity}")
+                    
+                    # Calculate target position based on IV
+                    position_to_add = await self.calculate_target_position(call1_iv, current_position, equity)
+                    
+                    if position_to_add > 0:
+                        logger.info(f"IV {call1_iv} triggers position increase of {position_to_add}")
+                        
+                        call_price = mark_price * 1.05
+                        call_option = next((option for option in call_options if option['strike'] > call_price), None)
+                        
+                        if call_option:
+                            best_ask_price, _ = await self.get_order_book(call_option['instrument_name'], 1)
+                            order_id = await self.send_order(
+                                side="sell",
+                                order_type="limit",
+                                instrument_name=call_option["instrument_name"],
+                                price=best_ask_price,
+                                amount=position_to_add
+                            )
+                            
+                            if order_id:
+                                await self._wait_order_fill(order_id, call_option["instrument_name"])
+                                # Add to active positions tracking
+                                self.active_positions[call_option["instrument_name"]] = {
+                                    "entry_price": self.get_position_by_instrument_name(call_option["instrument_name"])[0],
+                                    "amount": self.get_position_by_instrument_name(call_option["instrument_name"])[1]
+                                }
+                                logger.info(f"New position added: {call_option['instrument_name']}, Amount: {position_to_add}, Entry price: {best_ask_price}")
+                    
+                    await asyncio.sleep(60)  # Check every minute
+                    
+                except Exception as e:
+                    logger.error(f"Error in monitoring loop: {str(e)}")
+                    await asyncio.sleep(60)
+        finally:
+            # Ensure proper cleanup
+            await self.shutdown()
 
 if __name__ == "__main__":
     symbol = "BTC"
-    iv_threshold = 60
+    position_thresholds = {
+        55: 0.5,  # 半仓
+        65: 1.0,  # 满仓
+        75: 1.5   # 1.5倍杠杆
+    }
+    stop_loss_multiplier = 4.0
 
-    cover_call_client = CoverCallClient(symbol=symbol, iv_threshold=iv_threshold)
-    asyncio.run(cover_call_client.execute_covercall())
+    cover_call_client = CoverCallClient(
+        symbol=symbol,
+        position_thresholds=position_thresholds,
+        stop_loss_multiplier=stop_loss_multiplier
+    )
+    
+    try:
+        asyncio.run(cover_call_client.execute())
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down...")
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+    finally:
+        # Ensure the event loop is properly closed
+        loop = asyncio.get_event_loop()
+        loop.close()
