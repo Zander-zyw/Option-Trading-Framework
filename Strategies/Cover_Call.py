@@ -15,15 +15,21 @@ from Logger.Logger import logger
 ### import DeribitClient ###
 
 class CoverCallClient(DeribitClient):
-    def __init__(self, symbol, position_thresholds, stop_loss_multiplier):
+    def __init__(self, symbol, position_thresholds, stop_loss_multiplier, call_level):
         super().__init__()
         self.symbol = symbol
         self.position_thresholds = position_thresholds
         self.stop_loss_multiplier = stop_loss_multiplier
+        self.call_level = call_level
         self.is_running = True
         self.active_positions = {}  # Track active positions and their entry prices
         self.position_monitor = None
         self._setup_signal_handlers()
+
+        if self.symbol == "BTC":
+            self.base_amount = 0.1
+        elif self.symbol == "ETH":
+            self.base_amount = 1
 
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -238,7 +244,7 @@ class CoverCallClient(DeribitClient):
         position_to_add = target_position - abs(current_position)
 
         # 取到0.1的倍数
-        position_to_add = math.floor(position_to_add / 0.1) * 0.1
+        position_to_add = math.floor(position_to_add / self.base_amount) * self.base_amount
         
         return position_to_add
 
@@ -354,7 +360,7 @@ class CoverCallClient(DeribitClient):
                     if position_to_add > 0:
                         logger.info(f"IV {call1_iv} triggers position increase of {position_to_add}")
                         
-                        call_price = mark_price * 1.05
+                        call_price = mark_price * self.call_level
                         call_option = next((option for option in call_options if option['strike'] > call_price), None)
                         
                         if call_option:
@@ -386,18 +392,19 @@ class CoverCallClient(DeribitClient):
             await self.shutdown()
 
 if __name__ == "__main__":
-    symbol = "BTC"
+    symbol = "ETH"
     position_thresholds = {
         55: 0.5,  # 半仓
         65: 1.0,  # 满仓
         75: 1.5   # 1.5倍杠杆
     }
     stop_loss_multiplier = 4.0
-
+    call_level = 1.2
     cover_call_client = CoverCallClient(
         symbol=symbol,
         position_thresholds=position_thresholds,
-        stop_loss_multiplier=stop_loss_multiplier
+        stop_loss_multiplier=stop_loss_multiplier,
+        call_level=call_level
     )
     
     try:

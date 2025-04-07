@@ -11,30 +11,35 @@ A robust framework for automated option trading strategies, currently supporting
 - Comprehensive logging
 - Risk management with stop-loss mechanisms
 
-## Current Strategy: Cover Call
+## Implemented Strategies
 
-The framework currently implements a Cover Call strategy with the following features:
+### 1. Cover Call Strategy
+A strategy that sells call options when IV is high, with dynamic position sizing and stop-loss management.
 
-### Position Management
+#### Features
 - Dynamic position sizing based on IV levels:
   - IV >= 55: 0.5x leverage (半仓)
   - IV >= 65: 1.0x leverage (满仓)
   - IV >= 75: 1.5x leverage (1.5倍杠杆)
-
-### Risk Management
-- Stop-loss mechanism based on settlement price
-- Configurable stop-loss multiplier (default: 4x)
+- Stop-loss mechanism based on settlement price (default: 4x)
+- Call level setting (default: 1.2x)
 - Position monitoring and automatic closing
+- State persistence and recovery
+- Graceful shutdown handling
 
-### State Management
-- Automatic state saving on shutdown
-- State restoration on restart
-- Position tracking and management
+### 2. Straddle Strategy (Planned)
+[Strategy description to be added]
+
+### 3. Delta Neutral Strategy (Planned)
+[Strategy description to be added]
 
 ## Requirements
 
 - Python 3.7+
-- Required packages (to be added to requirements.txt)
+- Required packages:
+  - aiohttp>=3.8.0
+  - websockets>=10.0
+  - cryptography>=3.4.7
 
 ## Installation
 
@@ -51,8 +56,7 @@ pip install -r requirements.txt
 
 ## Configuration
 
-The strategy can be configured through the following parameters:
-
+### Cover Call Strategy Configuration
 ```python
 symbol = "BTC"  # Trading symbol
 position_thresholds = {
@@ -61,9 +65,12 @@ position_thresholds = {
     75: 1.5   # 1.5倍杠杆
 }
 stop_loss_multiplier = 4.0  # Stop loss multiplier
+call_level = 1.2  # Call level
 ```
 
 ## Usage
+
+### Running Cover Call Strategy
 
 1. Start the strategy:
 ```bash
@@ -72,7 +79,7 @@ python Strategies/Cover_Call.py
 
 2. Monitor the strategy:
 - Logs are written to the configured logging destination
-- State is saved in `State/cover_call_state_{symbol}.json`
+- State is saved in `state/cover_call_state_{symbol}.json`
 
 3. Stop the strategy:
 - Press Ctrl+C for graceful shutdown
@@ -84,7 +91,7 @@ pkill -f "python Strategies/Cover_Call.py"
 ## State Management
 
 The framework automatically:
-- Saves current positions to `State/cover_call_state_{symbol}.json`
+- Saves current positions to `state/cover_call_state_{symbol}.json`
 - Loads previous state on restart
 - Maintains position tracking during runtime
 
