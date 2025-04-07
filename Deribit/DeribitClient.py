@@ -30,10 +30,12 @@ class DeribitClient:
         self.websocket = None
         self.is_running = True
         self.pending_requests = {}  # 用于存储等待响应的 Future
+        self._request_counter = 0  # Add a counter for request IDs
 
     # == Generate ID for Requests ==
     def _generate_request_id(self):
-        req_id = int(datetime.now().timestamp() * 1000)
+        self._request_counter = (self._request_counter + 1) % 1000  # Cycle through 0-999
+        req_id = int(datetime.now().timestamp() * 1000000) + self._request_counter  # Use microseconds and add counter
         return req_id
 
     # == Generate Authentication Message ==
@@ -176,7 +178,6 @@ class DeribitClient:
                 "kind": kind
             }
         }
-
         try:
             response = await self.send_request(get_instruments_msg)
             return response
@@ -223,8 +224,7 @@ class DeribitClient:
         # Send the order message
         logger.info(f"Sending order message: {order_msg}")
         try:
-            await self.websocket.send(json.dumps(order_msg))
-            response = await self.websocket.recv()
+            response = await self.send_request(order_msg)
             logger.info(f"Order response: {response}")
             return response
         except Exception as e:
@@ -316,7 +316,6 @@ class DeribitClient:
                 "extended": extended
             }
         }
-
         try:
             response = await self.send_request(get_account_summary_msg)
             logger.info(f"Get account summary response: {response}")
@@ -364,7 +363,6 @@ class DeribitClient:
                 "instrument_name": instrument_name
             }
         }
-
         try:
             response = await self.send_request(get_position_by_instrument_name_msg)
             logger.info(f"Get position by instrument name response: {response}")
@@ -415,7 +413,6 @@ class DeribitClient:
                 "order_id" : order_id
             }
         }
-
         try:
             response = await self.send_request(state_request)
             logger.info(f"Get order state response: {response}")
@@ -432,13 +429,3 @@ class DeribitClient:
             logger.info("WebSocket connection closed manually.")
         else: 
             logger.error("No WebSocket connection to close.")
-
-# # example main for get_position_by_instrument_name
-# async def main():
-#     client = DeribitClient()
-#     await client.connect()
-#     await client.get_positions("ETH", "option")
-#     await client.disconnect()
-
-# if __name__ == "__main__":
-#     asyncio.run(main())

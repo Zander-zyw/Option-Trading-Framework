@@ -21,6 +21,7 @@ class CoverCallClient(DeribitClient):
         self.position_thresholds = position_thresholds
         self.stop_loss_multiplier = stop_loss_multiplier
         self.call_level = call_level
+                
         self.is_running = True
         self.active_positions = {}  # Track active positions and their entry prices
         self.position_monitor = None
@@ -69,8 +70,13 @@ class CoverCallClient(DeribitClient):
                     state = json.load(f)
                     self.active_positions = state.get('active_positions', {})
                     logger.info(f"Loaded {len(self.active_positions)} positions from state file")
+            else:
+                logger.info(f"No existing state file found at {state_file}, starting with empty positions")
+                self.active_positions = {}
         except Exception as e:
             logger.error(f"Failed to load state: {str(e)}")
+            logger.info("Starting with empty positions")
+            self.active_positions = {}
 
     async def shutdown(self):
         """Graceful shutdown procedure"""
@@ -120,12 +126,12 @@ class CoverCallClient(DeribitClient):
 
             if (datetime.now() - start_time).total_seconds() <= timeout:
                 await self.cancel_order(order_id)
-                best_ask, _ = await self.get_order_book(order_name)
+                best_ask, _ = await self.get_order_book(order_name, 1)
                 order_id = await self.send_order(side="sell", order_type="limit", instrument_name=order_name, price=best_ask, amount=remaining_call)
 
             else:
                 await self.cancel_order(order_id)
-                _, best_bid = await self.get_order_book(order_name)
+                _, best_bid = await self.get_order_book(order_name, 1)
                 order_id = await self.send_order(side="sell", order_type="limit", instrument_name=order_name, price=best_bid, amount=remaining_call)
             
             await asyncio.sleep(60)
@@ -205,17 +211,17 @@ class CoverCallClient(DeribitClient):
         response = await super().get_positions(currency, kind)
 
         if response:
-            total_positions = sum(abs(float(position["result"]["amount"])) for position in response["result"])
+            total_positions = sum(abs(float(position["size"])) for position in response["result"])
             logger.info(f"Total positions: {total_positions}")
             return total_positions
         else:
             return None
 
     async def get_position_by_instrument_name(self, instrument_name):
-        response = await super().get_position_by_instrument_name(instrument_name)
+        response = await super().get_position_by_instrument_name(instrument_name=instrument_name)
 
         if response:
-            return response["result"]["settlement_price"], response["result"]["size"]
+            return response["result"]["average_price"], response["result"]["size"], response["result"]["mark_price"]
         else:
             return None
     
@@ -251,18 +257,23 @@ class CoverCallClient(DeribitClient):
     async def monitor_positions(self):
         while self.is_running:
             try:
+                # Skip monitoring if active_positions is empty
+                if len(self.active_positions) == 0:
+                    await asyncio.sleep(60)  # Check less frequently when no positions
+                    continue
+
                 # Only monitor positions this strategy opened
                 for instrument_name, position_info in list(self.active_positions.items()):
                     try:
                         # Get current mark price
-                        mark_price = await self.ticker(instrument_name)
+                        _, _, mark_price = await self.get_position_by_instrument_name(instrument_name=instrument_name)
                         
                         if mark_price:
                             # Get settlement price from position info
-                            settlement_price = position_info["entry_price"]
+                            average_price = position_info["entry_price"]
                             
                             # Calculate stop loss price (stop_loss_multiplier * settlement price)
-                            stop_loss_price = settlement_price * self.stop_loss_multiplier
+                            stop_loss_price = average_price * self.stop_loss_multiplier
                             
                             logger.info(f"Position: {instrument_name}, Amount: {position_info['amount']}, Mark Price: {mark_price}, Stop Loss: {stop_loss_price}")
                             
@@ -271,14 +282,14 @@ class CoverCallClient(DeribitClient):
                                 logger.warning(f"Stop loss triggered for {instrument_name} at mark price {mark_price}")
                                 
                                 # Close position (we know it's a short position)
-                                best_ask, _ = await self.get_order_book(instrument_name, 1)
+                                _, best_bid = await self.get_order_book(instrument_name, 1)
                                 
                                 # Send close order
                                 order_id = await self.send_order(
                                     side="buy",  # Close short position
                                     order_type="limit",
                                     instrument_name=instrument_name,
-                                    price=best_ask,
+                                    price=best_bid,
                                     amount=position_info["amount"]
                                 )
                                 
@@ -333,7 +344,7 @@ class CoverCallClient(DeribitClient):
                         await asyncio.sleep(60)
                         continue
                     
-                    call_options = await self.get_instruments(currency="BTC", kind="option")
+                    call_options = await self.get_instruments(currency=self.symbol, kind="option")
                     if not call_options:
                         await asyncio.sleep(60)
                         continue
@@ -376,9 +387,10 @@ class CoverCallClient(DeribitClient):
                             if order_id:
                                 await self._wait_order_fill(order_id, call_option["instrument_name"])
                                 # Add to active positions tracking
+                                average_price, amount, _ = await self.get_position_by_instrument_name(call_option["instrument_name"])
                                 self.active_positions[call_option["instrument_name"]] = {
-                                    "entry_price": self.get_position_by_instrument_name(call_option["instrument_name"])[0],
-                                    "amount": self.get_position_by_instrument_name(call_option["instrument_name"])[1]
+                                    "entry_price": average_price - max(0.0003, average_price * 0.0003),
+                                    "amount": amount
                                 }
                                 logger.info(f"New position added: {call_option['instrument_name']}, Amount: {position_to_add}, Entry price: {best_ask_price}")
                     
@@ -396,7 +408,8 @@ if __name__ == "__main__":
     position_thresholds = {
         55: 0.5,  # 半仓
         65: 1.0,  # 满仓
-        75: 1.5   # 1.5倍杠杆
+        75: 1.5,  # 1.5倍杠杆
+        120: 2.0  # 2倍杠杆
     }
     stop_loss_multiplier = 4.0
     call_level = 1.2
