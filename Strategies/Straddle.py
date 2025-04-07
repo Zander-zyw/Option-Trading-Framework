@@ -48,7 +48,7 @@ class StraddleClient(DeribitClient):
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
             
-            state_file = os.path.join(BASE_DIR, 'State', f'cover_call_state_{self.symbol}.json')
+            state_file = os.path.join(BASE_DIR, 'State', f'straddle_state_{self.symbol}.json')
             os.makedirs(os.path.dirname(state_file), exist_ok=True)
             
             with open(state_file, 'w') as f:
@@ -61,7 +61,7 @@ class StraddleClient(DeribitClient):
     async def load_state(self):
         """Load saved state from file"""
         try:
-            state_file = os.path.join(BASE_DIR, 'state', f'cover_call_state_{self.symbol}.json')
+            state_file = os.path.join(BASE_DIR, 'State', f'straddle_state_{self.symbol}.json')
             if os.path.exists(state_file):
                 with open(state_file, 'r') as f:
                     state = json.load(f)
@@ -221,7 +221,7 @@ class StraddleClient(DeribitClient):
         response = await super().get_position_by_instrument_name(instrument_name)
 
         if response:
-            return response["result"]["settlement_price"], response["result"]["size"]
+            return response["result"]["average_price"], response["result"]["size"], response["result"]["mark_price"]
         else:
             return None
 
@@ -310,13 +310,17 @@ class StraddleClient(DeribitClient):
 
                 if call_order_id and put_order_id:
                     await self._wait_order_fill(call_order_id, put_order_id, call_option['instrument_name'], put_option['instrument_name'])
+
+                    call_price, call_amount, _ = await self.get_position_by_instrument_name(call_option['instrument_name'])
+                    put_price, put_amount, _ = await self.get_position_by_instrument_name(put_option['instrument_name'])
+
                     self.active_positions[call_option['instrument_name']] = {
-                        'entry_price': call_best_ask,
-                        'amount': position_size
+                        'entry_price': call_price - max(0.0003, call_price * 0.0003),
+                        'amount': call_amount
                     }
                     self.active_positions[put_option['instrument_name']] = {
-                        'entry_price': put_best_ask,
-                        'amount': position_size
+                        'entry_price': put_price - max(0.0003, put_price * 0.0003),
+                        'amount': put_amount
                     }
 
                 # Wait until next Friday
@@ -329,7 +333,8 @@ class StraddleClient(DeribitClient):
 
 if __name__ == "__main__":
     symbol = "BTC"
-    straddle_client = StraddleClient(symbol)
+    side = "sell"
+    straddle_client = StraddleClient(symbol, side)
     
     try:
         # Execute the straddle strategy

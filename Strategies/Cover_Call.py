@@ -265,40 +265,48 @@ class CoverCallClient(DeribitClient):
                 # Only monitor positions this strategy opened
                 for instrument_name, position_info in list(self.active_positions.items()):
                     try:
-                        # Get current mark price
-                        _, _, mark_price = await self.get_position_by_instrument_name(instrument_name=instrument_name)
+                        # Get current position data
+                        position_data = await self.get_position_by_instrument_name(instrument_name=instrument_name)
+                        if not position_data:
+                            logger.warning(f"No position data found for {instrument_name}, skipping...")
+                            continue
+
+                        average_price, size, mark_price = position_data
                         
-                        if mark_price:
-                            # Get settlement price from position info
-                            average_price = position_info["entry_price"]
+                        # Calculate stop loss price based on entry price
+                        stop_loss_price = average_price * self.stop_loss_multiplier
+                        
+                        logger.info(f"Position: {instrument_name}, Size: {size}, Mark Price: {mark_price}, Stop Loss: {stop_loss_price}")
+                        
+                        # Check if we need to close position
+                        if mark_price >= stop_loss_price:
+                            logger.warning(f"Stop loss triggered for {instrument_name} at mark price {mark_price}")
                             
-                            # Calculate stop loss price (stop_loss_multiplier * settlement price)
-                            stop_loss_price = average_price * self.stop_loss_multiplier
+                            # Determine closing side based on position size
+                            close_side = "buy" if size < 0 else "sell"
+                            size_abs = abs(size)
                             
-                            logger.info(f"Position: {instrument_name}, Amount: {position_info['amount']}, Mark Price: {mark_price}, Stop Loss: {stop_loss_price}")
+                            # Get best price for closing
+                            best_ask, best_bid = await self.get_order_book(instrument_name, 1)
+                            close_price = best_bid if close_side == "buy" else best_ask
                             
-                            # Check if we need to close position
-                            if mark_price >= stop_loss_price:
-                                logger.warning(f"Stop loss triggered for {instrument_name} at mark price {mark_price}")
+                            logger.info(f"Closing position with {close_side} order at price {close_price}")
+                            
+                            # Send close order
+                            order_id = await self.send_order(
+                                side=close_side,
+                                order_type="limit",
+                                instrument_name=instrument_name,
+                                price=close_price,
+                                amount=size_abs
+                            )
+                            
+                            if order_id:
+                                await self._wait_order_fill(order_id, instrument_name)
+                                logger.info(f"Position closed for {instrument_name}")
                                 
-                                # Close position (we know it's a short position)
-                                _, best_bid = await self.get_order_book(instrument_name, 1)
-                                
-                                # Send close order
-                                order_id = await self.send_order(
-                                    side="buy",  # Close short position
-                                    order_type="limit",
-                                    instrument_name=instrument_name,
-                                    price=best_bid,
-                                    amount=position_info["amount"]
-                                )
-                                
-                                if order_id:
-                                    await self._wait_order_fill(order_id, instrument_name)
-                                    logger.info(f"Position closed for {instrument_name}")
-                                    
-                                    # Remove from active positions
-                                    del self.active_positions[instrument_name]
+                                # Remove from active positions
+                                del self.active_positions[instrument_name]
                     
                     except Exception as e:
                         logger.error(f"Error monitoring position {instrument_name}: {str(e)}")
