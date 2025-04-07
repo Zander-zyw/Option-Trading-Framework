@@ -433,12 +433,12 @@ class DeribitClient:
         else: 
             logger.error("No WebSocket connection to close.")
 
-# example main for get_position_by_instrument_name
-async def main():
-    client = DeribitClient()
-    await client.connect()
-    await client.get_positions("ETH", "option")
-    await client.disconnect()
+# # example main for get_position_by_instrument_name
+# async def main():
+#     client = DeribitClient()
+#     await client.connect()
+#     await client.get_positions("ETH", "option")
+#     await client.disconnect()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# if __name__ == "__main__":
+#     asyncio.run(main())
