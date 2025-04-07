@@ -44,7 +44,7 @@ class CoverCallClient(DeribitClient):
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
             
-            state_file = os.path.join(BASE_DIR, 'state', f'cover_call_state_{self.symbol}.json')
+            state_file = os.path.join(BASE_DIR, 'State', f'cover_call_state_{self.symbol}.json')
             os.makedirs(os.path.dirname(state_file), exist_ok=True)
             
             with open(state_file, 'w') as f:
@@ -57,7 +57,7 @@ class CoverCallClient(DeribitClient):
     async def load_state(self):
         """Load saved state from file"""
         try:
-            state_file = os.path.join(BASE_DIR, 'state', f'cover_call_state_{self.symbol}.json')
+            state_file = os.path.join(BASE_DIR, 'State', f'cover_call_state_{self.symbol}.json')
             if os.path.exists(state_file):
                 with open(state_file, 'r') as f:
                     state = json.load(f)
