@@ -414,10 +414,10 @@ class CoverCallClient(DeribitClient):
 if __name__ == "__main__":
     symbol = "ETH"
     position_thresholds = {
-        55: 0.5,  # 半仓
-        65: 1.0,  # 满仓
-        75: 1.5,  # 1.5倍杠杆
-        120: 2.0  # 2倍杠杆
+        60: 0.5,  # 半仓
+        70: 1.0,  # 满仓
+        80: 1.5,  # 1.5倍杠杆
+        100: 2.0  # 2倍杠杆
     }
     stop_loss_multiplier = 4.0
     call_level = 1.2

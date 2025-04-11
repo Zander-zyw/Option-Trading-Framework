@@ -12,12 +12,15 @@ from Logger.Logger import logger
 from datetime import datetime, timedelta, timezone, time
 import asyncio
 import math
+import json
+import signal
 
 class StraddleClient(DeribitClient):
-    def __init__(self, symbol, side):
+    def __init__(self, symbol, side, leverage):
         super().__init__()
         self.symbol = symbol
         self.side = side
+        self.leverage = leverage
 
         if self.symbol == "BTC":
             self.base_amount = 0.1
@@ -28,6 +31,11 @@ class StraddleClient(DeribitClient):
         self.active_positions = {}
         self.position_monitor = None
         self._setup_signal_handlers()
+        
+        # Account monitoring variables
+        self.peak_equity = None
+        self.initial_equity = None
+        self.weekly_initial_equity = None
     
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -45,6 +53,9 @@ class StraddleClient(DeribitClient):
         try:
             state = {
                 'active_positions': self.active_positions,
+                'peak_equity': self.peak_equity,
+                'initial_equity': self.initial_equity,
+                'weekly_initial_equity': self.weekly_initial_equity,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
             
@@ -66,14 +77,23 @@ class StraddleClient(DeribitClient):
                 with open(state_file, 'r') as f:
                     state = json.load(f)
                     self.active_positions = state.get('active_positions', {})
-                    logger.info(f"Loaded {len(self.active_positions)} positions from state file")
+                    self.peak_equity = state.get('peak_equity')
+                    self.initial_equity = state.get('initial_equity')
+                    self.weekly_initial_equity = state.get('weekly_initial_equity')
+                    logger.info(f"Loaded state from {state_file}")
             else:
-                logger.info(f"No existing state file found at {state_file}, starting with empty positions")
+                logger.info(f"No existing state file found at {state_file}, starting fresh")
                 self.active_positions = {}
+                self.peak_equity = None
+                self.initial_equity = None
+                self.weekly_initial_equity = None
         except Exception as e:
             logger.error(f"Failed to load state: {str(e)}")
-            logger.info("Starting with empty positions")
+            logger.info("Starting with fresh state")
             self.active_positions = {}
+            self.peak_equity = None
+            self.initial_equity = None
+            self.weekly_initial_equity = None
 
     async def shutdown(self):
         """Graceful shutdown procedure"""
@@ -169,6 +189,12 @@ class StraddleClient(DeribitClient):
             
             await asyncio.sleep(60)
 
+    # Get the remaining amount of an order
+    async def get_order_state(self, order_id):
+        response = await super().get_order_state(order_id)
+
+        return response["result"]["amount"] - response["result"]["filled_amount"]
+
     # Get the mark price for the next expiry date
     async def ticker(self, instrument_name: str):
         response = await super().ticker(instrument_name=instrument_name)
@@ -240,7 +266,144 @@ class StraddleClient(DeribitClient):
             return response['result']['order']['order_id']
         else:
             return None
-    
+
+    async def close_positions(self, current_equity, ratio=1.0):
+        """Close positions with specified ratio (1.0 for all positions)"""
+        # Get all active positions
+        positions = list(self.active_positions.items())
+        if len(positions) != 2:  # Should have exactly 2 positions (call and put)
+            logger.error(f"Unexpected number of positions: {len(positions)}")
+            return
+
+        # Check if the instrument name ends with "C" or "P"
+        for instrument_name, position_info in positions:
+            if instrument_name.endswith("C"):
+                call_instrument = instrument_name
+                call_info = position_info
+            else:
+                put_instrument = instrument_name
+                put_info = position_info
+
+        try:
+            # Get order book for both options
+            call_best_ask, call_best_bid = await self.get_order_book(call_instrument, 1)
+            put_best_ask, put_best_bid = await self.get_order_book(put_instrument, 1)
+            
+            # Use best_bid for buy positions and best_ask for sell positions
+            call_close_price = call_best_ask if self.side == "buy" else call_best_bid
+            put_close_price = put_best_ask if self.side == "buy" else put_best_bid
+            
+            # Calculate close amount
+            call_close_amount = abs(call_info["amount"]) * ratio
+            put_close_amount = abs(put_info["amount"]) * ratio
+            
+            # Round to base amount
+            call_close_amount = math.floor(call_close_amount / self.base_amount) * self.base_amount
+            put_close_amount = math.floor(put_close_amount / self.base_amount) * self.base_amount
+            
+            # Send close orders for both positions
+            call_order_id = await self.send_order(
+                side="sell" if self.side == "buy" else "buy",
+                order_type="limit",
+                instrument_name=call_instrument,
+                price=call_close_price,
+                amount=call_close_amount
+            )
+            
+            put_order_id = await self.send_order(
+                side="sell" if self.side == "buy" else "buy",
+                order_type="limit",
+                instrument_name=put_instrument,
+                price=put_close_price,
+                amount=put_close_amount
+            )
+            
+            if call_order_id and put_order_id:
+                await self._wait_order_fill(call_order_id, put_order_id, call_instrument, put_instrument)
+                logger.info(f"Positions closed - Call: {call_instrument} at {call_close_price}, "
+                          f"Put: {put_instrument} at {put_close_price}")
+                
+                if ratio == 1.0:
+                    # Remove positions if closing all
+                    del self.active_positions[call_instrument]
+                    del self.active_positions[put_instrument]
+                else:
+                    # Update remaining positions
+                    self.active_positions[call_instrument]["amount"] -= call_close_amount
+                    self.active_positions[put_instrument]["amount"] -= put_close_amount
+        
+        except Exception as e:
+            logger.error(f"Error closing positions: {str(e)}")
+            return
+        
+        # Save state after closing positions
+        await self.save_state()
+        
+        # Update peak equity
+        if current_equity > self.peak_equity:
+            self.peak_equity = current_equity
+            await self.save_state()
+
+    async def monitor_positions(self):
+        while self.is_running:
+            try:
+                # Get current account equity
+                current_equity = await self.get_account_summary(currency=self.symbol)
+                if not current_equity:
+                    await asyncio.sleep(60)
+                    continue
+
+                # Initialize peak equity if not set
+                if self.peak_equity is None:
+                    self.peak_equity = current_equity
+                    self.initial_equity = current_equity
+                    await self.save_state()
+
+                # Update peak equity if current equity is higher
+                if current_equity > self.peak_equity:
+                    self.peak_equity = current_equity
+                    await self.save_state()
+
+                # Check if it's UTC Friday 8:00 (new week)
+                now = datetime.now(timezone.utc)
+                is_friday_8am = now.weekday() == 4 and now.hour == 8 and now.minute < 1  # Friday 8:00 UTC
+                
+                if self.weekly_initial_equity is None or is_friday_8am:
+                    self.weekly_initial_equity = current_equity
+                    await self.save_state()
+                    logger.info(f"New week started at {now} - Weekly initial equity: {self.weekly_initial_equity}")
+
+                # Calculate weekly return
+                weekly_return = (current_equity - self.weekly_initial_equity) / self.weekly_initial_equity
+                
+                logger.info(f"Account Equity: {current_equity}, Weekly Initial Equity: {self.weekly_initial_equity}, "
+                          f"Weekly Return: {weekly_return*100:.2f}%")
+
+                # Check for take profit conditions
+                if weekly_return >= 0.01:  # 1% weekly return
+                    logger.info(f"Take profit triggered at weekly return {weekly_return*100:.2f}% - Closing all positions")
+                    await self.close_positions(current_equity, ratio=1.0)
+                elif weekly_return >= 0.008:  # 0.8% weekly return
+                    logger.info(f"Partial take profit triggered at weekly return {weekly_return*100:.2f}% - Closing 50% of positions")
+                    await self.close_positions(current_equity, ratio=0.5)
+
+                # Check if drawdown exceeds 1%
+                drawdown = (self.peak_equity - current_equity) / self.peak_equity
+                
+                logger.info(f"Account Equity: {current_equity}, Peak Equity: {self.peak_equity}, "
+                          f"Drawdown: {drawdown*100:.2f}%")
+                
+                if drawdown >= 0.01:  # 1% drawdown
+                    logger.warning(f"Account stop loss triggered at equity {current_equity} "
+                                f"(Drawdown: {drawdown*100:.2f}%)")
+                    await self.close_positions(current_equity, ratio=1.0)
+                
+                await asyncio.sleep(60)  # Check every 60 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in account monitoring: {str(e)}")
+                await asyncio.sleep(60)
+
     # Main Logic to execute the straddle strategy
     async def execute(self):
         await self.connect()
@@ -268,11 +431,9 @@ class StraddleClient(DeribitClient):
                     continue
 
                 # Calculate position size based on 1x leverage
-                position_size = equity * 1.0  # 1x leverage
-                if self.symbol == "BTC":
-                    position_size = math.floor(position_size / 0.1) * 0.1  # Round to nearest 0.1
-                elif self.symbol == "ETH":
-                    position_size = math.floor(position_size)  # Round to nearest 1
+                position_size = 0.5 * equity * self.leverage  # 1x leverage
+
+                position_size = math.floor(position_size / self.base_amount) * self.base_amount
 
                 # Get the mark price for the next expiry date
                 instrument_name = f"{self.symbol}-{self._get_next_expiry().strftime('%-d%b%y').upper()}"
@@ -334,7 +495,8 @@ class StraddleClient(DeribitClient):
 if __name__ == "__main__":
     symbol = "BTC"
     side = "sell"
-    straddle_client = StraddleClient(symbol, side)
+    leverage = 1.0
+    straddle_client = StraddleClient(symbol, side, leverage)
     
     try:
         # Execute the straddle strategy
