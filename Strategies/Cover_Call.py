@@ -2,10 +2,6 @@
 import sys
 import os
 import signal
-import json
-import asyncio
-from datetime import datetime, timedelta, timezone, time
-import math
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
@@ -13,6 +9,11 @@ sys.path.append(BASE_DIR)
 from Deribit.DeribitClient import DeribitClient
 from Logger.Logger import logger
 ### import DeribitClient ###
+
+import json
+import asyncio
+from datetime import datetime, timedelta, timezone, time
+import math
 
 class CoverCallClient(DeribitClient):
     def __init__(self, symbol, position_thresholds, stop_loss_multiplier, call_level):

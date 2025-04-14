@@ -416,12 +416,8 @@ class StraddleClient(DeribitClient):
 
         try:
             while self.is_running:
-                # Check if today is Friday
-                today = datetime.now(timezone.utc)
-                if today.weekday() != 4:  # Not Friday
-                    logger.info("Not Friday, waiting until next Friday...")
-                    await self._wait_until_execution()
-                    continue
+                # Wait until next Friday 17:00 UTC
+                await self._wait_until_execution()
 
                 # Get account equity
                 equity = await self.get_account_summary(currency=self.symbol)
@@ -432,7 +428,6 @@ class StraddleClient(DeribitClient):
 
                 # Calculate position size based on 1x leverage
                 position_size = 0.5 * equity * self.leverage  # 1x leverage
-
                 position_size = math.floor(position_size / self.base_amount) * self.base_amount
 
                 # Get the mark price for the next expiry date
@@ -443,38 +438,56 @@ class StraddleClient(DeribitClient):
                     await asyncio.sleep(60)
                     continue
 
+                # Get call and put options for next week
                 call_options, put_options = await self.get_instruments(currency=self.symbol, kind="option")
 
                 if not call_options or not put_options:
-                    logger.error("No suitable options found for straddle strategy")
+                    logger.error("No suitable options found for strangle strategy")
                     await asyncio.sleep(60)
                     continue
 
-                # Straddle strategy (strike price is the same for both call and put, and strike > mark price)
+                # Strangle strategy (strike price is different for call and put)
+                # For call: strike > mark price
+                # For put: strike < mark price
                 call_option = next((option for option in call_options if option['strike'] > mark_price), None)
-                put_option = next((option for option in put_options if option['strike'] > mark_price), None)
+                put_option = next((option for option in put_options if option['strike'] < mark_price), None)
 
                 if not call_option or not put_option:
-                    logger.error("No suitable options found for straddle strategy")
+                    logger.error("No suitable options found for strangle strategy")
                     await asyncio.sleep(60)
                     continue
 
                 logger.info(f"Call option: {call_option['instrument_name']}, Put option: {put_option['instrument_name']}")
 
                 # Get the order book for both options
-                call_best_ask, call_best_bid = await self.get_order_book(call_option['instrument_name'], 5)
-                put_best_ask, put_best_bid = await self.get_order_book(put_option['instrument_name'], 5)
+                call_best_ask, _ = await self.get_order_book(call_option['instrument_name'], 5)
+                put_best_ask, _ = await self.get_order_book(put_option['instrument_name'], 5)
 
-                # Execute the straddle strategy
-                call_order_id = await self.send_order(side=self.side, order_type="limit", instrument_name=call_option['instrument_name'], price=call_best_ask, amount=position_size)
-                put_order_id = await self.send_order(side=self.side, order_type="limit", instrument_name=put_option['instrument_name'], price=put_best_ask, amount=position_size)
+                # Execute the strangle strategy
+                call_order_id = await self.send_order(
+                    side=self.side,
+                    order_type="limit",
+                    instrument_name=call_option['instrument_name'],
+                    price=call_best_ask,
+                    amount=position_size
+                )
+                
+                put_order_id = await self.send_order(
+                    side=self.side,
+                    order_type="limit",
+                    instrument_name=put_option['instrument_name'],
+                    price=put_best_ask,
+                    amount=position_size
+                )
 
                 if call_order_id and put_order_id:
                     await self._wait_order_fill(call_order_id, put_order_id, call_option['instrument_name'], put_option['instrument_name'])
 
+                    # Get position details after fill
                     call_price, call_amount, _ = await self.get_position_by_instrument_name(call_option['instrument_name'])
                     put_price, put_amount, _ = await self.get_position_by_instrument_name(put_option['instrument_name'])
 
+                    # Update active positions
                     self.active_positions[call_option['instrument_name']] = {
                         'entry_price': call_price - max(0.0003, call_price * 0.0003),
                         'amount': call_amount
@@ -484,8 +497,8 @@ class StraddleClient(DeribitClient):
                         'amount': put_amount
                     }
 
-                # Wait until next Friday
-                await self._wait_until_execution()
+                    # Save state after opening new positions
+                    await self.save_state()
 
         except Exception as e:
             logger.error(f"Error in execution loop: {str(e)}")
