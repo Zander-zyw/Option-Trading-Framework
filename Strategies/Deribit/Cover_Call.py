@@ -15,22 +15,23 @@ import asyncio
 from datetime import datetime, timedelta, timezone, time
 import math
 
-class DeltaNeutralClient(DeribitClient):
-    def __init__(self, symbol, strangle_ratio, position_thresholds, hedging_threshold):
+class CoverCallClient(DeribitClient):
+    def __init__(self, symbol, position_thresholds, stop_loss_multiplier, call_level):
         super().__init__()
         self.symbol = symbol
-        self.strangle_ratio = strangle_ratio
         self.position_thresholds = position_thresholds
-        self.hedging_threshold = hedging_threshold
-        if self.symbol == "BTC":
-            self.base_amount = 0.1
-        else:   # ETH
-            self.base_amount = 1
-
+        self.stop_loss_multiplier = stop_loss_multiplier
+        self.call_level = call_level
+                
         self.is_running = True
-        self.active_positions = {}
+        self.active_positions = {}  # Track active positions and their entry prices
         self.position_monitor = None
         self._setup_signal_handlers()
+
+        if self.symbol == "BTC":
+            self.base_amount = 0.1
+        elif self.symbol == "ETH":
+            self.base_amount = 1
 
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -112,35 +113,31 @@ class DeltaNeutralClient(DeribitClient):
             
         return next_friday
     
-    # Wait until the next Friday 8:30 UTC or execute directly if past
-    async def _wait_until_execution(self):
-        now = datetime.now(timezone.utc)
- 
-        # Calculate next Friday
-        days_until_friday = (4 - now.weekday()) % 7  # Friday is the 4th day of the week
-        next_friday = now.date() + timedelta(days=days_until_friday)
-        execution_time = datetime.combine(next_friday, time(8, 30), timezone.utc)
+    # Wait until order is filled
+    async def _wait_order_fill(self, order_id, order_name):
+        start_time = datetime.now()
+        timeout = 3600
 
-        # If current time is past this week's Friday 8:30 UTC, move to the next week
-        if now >= execution_time:
-            execution_time += timedelta(days=7)
+        while self.is_running:
+            remaining_call = await self.get_order_state(order_id)
 
-        # Calculate the waiting time
-        wait_seconds = (execution_time - now).total_seconds()
+            if remaining_call == 0:
+                logger.info(f"Cover call orders have been filled.")
+                break
 
-        logger.info(f"Waiting until next Friday 8:30 UTC. Remaining seconds: {wait_seconds}")
-        await asyncio.sleep(wait_seconds)
+            if (datetime.now() - start_time).total_seconds() <= timeout:
+                await self.cancel_order(order_id)
+                best_ask, _ = await self.get_order_book(order_name, 1)
+                order_id = await self.send_order(side="sell", order_type="limit", instrument_name=order_name, price=best_ask, amount=remaining_call)
 
-    # == Get account summary ==
-    async def get_account_summary(self, currency, extended=True):
-        response = await super().get_account_summary(currency, extended)
-
-        if response:
-            return response["result"]["equity"]
-        else:
-            return None
-        
-    # == Get the mark price for the next expiry date ==
+            else:
+                await self.cancel_order(order_id)
+                _, best_bid = await self.get_order_book(order_name, 1)
+                order_id = await self.send_order(side="sell", order_type="limit", instrument_name=order_name, price=best_bid, amount=remaining_call)
+            
+            await asyncio.sleep(60)
+    
+    # Get the mark price for the next expiry date
     async def ticker(self, instrument_name: str):
         response = await super().ticker(instrument_name=instrument_name)
 
@@ -151,8 +148,16 @@ class DeltaNeutralClient(DeribitClient):
         else:
             logger.error(f"Failed to get ticker for {instrument_name}")
             return None
-    
-    # == Get the option chain for the next expiry date ==
+        
+    async def send_order(self, side, order_type, instrument_name, price, amount):
+        response = await super().send_order(side, order_type, instrument_name, price, amount)
+
+        if response:
+            return response['result']['order']['order_id']
+        else:
+            return None
+        
+    # Get the option chain for the next expiry date
     async def get_instruments(self, currency, kind):
         response = await super().get_instruments(currency, kind)
 
@@ -166,46 +171,14 @@ class DeltaNeutralClient(DeribitClient):
 
             call_options = [
                 instrument for instrument in instruments
-                    if instrument['expiration_timestamp'] == next_friday_timestamp and instrument['option_type'] == 'call'
+                if instrument['expiration_timestamp'] == next_friday_timestamp and instrument['option_type'] == 'call'
             ]
 
-            put_options = [
-                instrument for instrument in instruments
-                    if instrument['expiration_timestamp'] == next_friday_timestamp and instrument['option_type'] == 'put'
-            ]
-
-            return call_options, put_options
+            return call_options
         else:
             logger.error("Failed to get instruments")
             return None
-    
-    # == Get position details by instrument name ==
-    async def get_position_by_instrument_name(self, instrument_name):
-        response = await super().get_position_by_instrument_name(instrument_name=instrument_name)
 
-        if response:
-            return response["result"]["average_price"], response["result"]["size"], response["result"]["mark_price"]
-        else:
-            return None
-        
-    # == Fetch best ask and bid prices ==
-    async def get_order_book(self, instrument_name, depth):
-        response = await super().get_order_book(instrument_name, depth)
-
-        best_ask = response["result"]["best_ask_price"]
-        best_bid = response["result"]["best_bid_price"]
-        logger.info(f"Best ask price for {instrument_name}: {best_ask}")
-        logger.info(f"Best bid price for {instrument_name}: {best_bid}")
-
-        return best_ask, best_bid
-    
-    # == Get remaining order amount ==
-    async def get_order_state(self, order_id):
-        response = await super().get_order_state(order_id)
-
-        return response["result"]["amount"] - response["result"]["filled_amount"]
-    
-    # == Get the mark IV for call1 option ==
     async def get_call1_iv(self, instrument_name):
         response = await super().get_order_book(instrument_name, 1)
 
@@ -217,73 +190,46 @@ class DeltaNeutralClient(DeribitClient):
             logger.error(f"Failed to get mark IV for {instrument_name}")
             return None
         
-    # == Get the maintenance margin ==
-    async def get_maintenance_margin(self, currency, extended=True):
+    async def get_order_book(self, instrument_name, depth):
+        response = await super().get_order_book(instrument_name, depth)
+
+        best_ask = response["result"]["best_ask_price"]
+        best_bid = response["result"]["best_bid_price"]
+        logger.info(f"Best ask price for {instrument_name}: {best_ask}")
+        logger.info(f"Best bid price for {instrument_name}: {best_bid}")
+
+        return best_ask, best_bid
+
+    async def get_account_summary(self, currency, extended=True):
         response = await super().get_account_summary(currency, extended)
 
         if response:
-            return response["result"]["maintenance_margin"]
+            return response["result"]["equity"]
         else:
-            logger.error(f"Failed to get maintenance margin for {currency}")
             return None
-        
-    # 检查是否所有订单已成交
-    async def wait_for_orders_to_fill(self, call_order_id, call_name, put_order_id, put_name):
-        timeout = 3600
-        call_filled = False
-        put_filled = False
-        start_time = None  # 开始计时的时间
-        
-        while self.is_running:
-            ### deactivate_hedging() ###
-            remaining_call = await self.get_order_state(call_order_id)
-            remaining_put = await self.get_order_state(put_order_id)
-            
-            print(f"Remaining Call Order: {remaining_call}")
-            print(f"Remaining Put Order: {remaining_put}")
-            
-            # 如果两个订单都已成交，则跳出循环
-            if remaining_call == 0 and remaining_put == 0:
-                print("Both orders have been filled.")
-                break
-            
-            if not call_filled and remaining_call == 0:
-                call_filled = True
-                if not start_time:
-                    start_time = datetime.now()
-                print("Call Order has been filled.")
-            
-            if not put_filled and remaining_put == 0:
-                put_filled = True
-                if not start_time:
-                    start_time = datetime.now()
-                print("Put Order has been filled.")
 
-            # 如果订单在规定时间内没有成交，则取消订单
-            if start_time:
-                if (datetime.now() - start_time).total_seconds() <= timeout:
-                    if call_filled and remaining_put > 0:
-                        await self.cancel_order(put_order_id)
-                        best_ask_put, _ = await self.get_order_book(put_name, 1)
-                        put_order_id = await self.send_order('sell', 'limit', put_name, best_ask_put, remaining_put)
-                    if put_filled and remaining_call > 0:
-                        await self.cancel_order(call_order_id)
-                        best_ask_call, _ = await self.get_order_book(call_name, 1)
-                        call_order_id = await self.send_order('sell', 'limit', call_name, best_ask_call, remaining_call)
-                else:
-                    if call_filled and remaining_put > 0:
-                        # Put Order Timeout
-                        await self.cancel_order(put_order_id)
-                        best_bid_put, _ = await self.get_order_book(put_name, 1)
-                        put_order_id = await self.send_order('sell', 'limit', put_name, best_bid_put, remaining_put)
-                        
-                    if put_filled and remaining_call > 0:
-                        await self.cancel_order(call_order_id)
-                        best_bid_call, _ = await self.get_order_book(call_name, 1)
-                        call_order_id = await self.send_order('sell', 'limit', call_name, best_bid_call, remaining_call)
-                        
-            # 等待1分钟后再次检查
-            await asyncio.sleep(60)
+    async def get_positions(self, currency, kind):
+        response = await super().get_positions(currency, kind)
+
+        if response:
+            total_positions = sum(abs(float(position["size"])) for position in response["result"])
+            logger.info(f"Total positions: {total_positions}")
+            return total_positions
+        else:
+            return None
+
+    async def get_position_by_instrument_name(self, instrument_name):
+        response = await super().get_position_by_instrument_name(instrument_name=instrument_name)
+
+        if response:
+            return response["result"]["average_price"], response["result"]["size"], response["result"]["mark_price"]
+        else:
+            return None
+    
+    async def get_order_state(self, order_id):
+        response = await super().get_order_state(order_id)
+
+        return response["result"]["amount"] - response["result"]["filled_amount"]
 
     async def calculate_target_position(self, current_iv, current_position, equity):
         target_leverage = 0
@@ -309,6 +255,69 @@ class DeltaNeutralClient(DeribitClient):
         
         return position_to_add
 
+    async def monitor_positions(self):
+        while self.is_running:
+            try:
+                # Skip monitoring if active_positions is empty
+                if len(self.active_positions) == 0:
+                    await asyncio.sleep(60)  # Check less frequently when no positions
+                    continue
+
+                # Only monitor positions this strategy opened
+                for instrument_name, position_info in list(self.active_positions.items()):
+                    try:
+                        # Get current position data
+                        position_data = await self.get_position_by_instrument_name(instrument_name=instrument_name)
+                        if not position_data:
+                            logger.warning(f"No position data found for {instrument_name}, skipping...")
+                            continue
+
+                        average_price, size, mark_price = position_data
+                        
+                        # Calculate stop loss price based on entry price
+                        stop_loss_price = average_price * self.stop_loss_multiplier
+                        
+                        logger.info(f"Position: {instrument_name}, Size: {size}, Mark Price: {mark_price}, Stop Loss: {stop_loss_price}")
+                        
+                        # Check if we need to close position
+                        if mark_price >= stop_loss_price:
+                            logger.warning(f"Stop loss triggered for {instrument_name} at mark price {mark_price}")
+                            
+                            # Determine closing side based on position size
+                            close_side = "buy" if size < 0 else "sell"
+                            size_abs = abs(size)
+                            
+                            # Get best price for closing
+                            best_ask, best_bid = await self.get_order_book(instrument_name, 1)
+                            close_price = best_bid if close_side == "buy" else best_ask
+                            
+                            logger.info(f"Closing position with {close_side} order at price {close_price}")
+                            
+                            # Send close order
+                            order_id = await self.send_order(
+                                side=close_side,
+                                order_type="limit",
+                                instrument_name=instrument_name,
+                                price=close_price,
+                                amount=size_abs
+                            )
+                            
+                            if order_id:
+                                await self._wait_order_fill(order_id, instrument_name)
+                                logger.info(f"Position closed for {instrument_name}")
+                                
+                                # Remove from active positions
+                                del self.active_positions[instrument_name]
+                    
+                    except Exception as e:
+                        logger.error(f"Error monitoring position {instrument_name}: {str(e)}")
+                        continue
+                
+                await asyncio.sleep(60)  # Check positions every 60 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in position monitoring: {str(e)}")
+                await asyncio.sleep(60)
 
     async def execute(self):
         await self.connect()
@@ -317,7 +326,7 @@ class DeltaNeutralClient(DeribitClient):
         await self.load_state()
         
         # Start position monitoring in background
-        self.position_monitor = asyncio.create_task(self.monitor_delta())
+        self.position_monitor = asyncio.create_task(self.monitor_positions())
         
         try:
             while self.is_running:
@@ -344,8 +353,8 @@ class DeltaNeutralClient(DeribitClient):
                         await asyncio.sleep(60)
                         continue
                     
-                    call_options, put_options = await self.get_instruments(currency=self.symbol, kind="option")
-                    if not call_options or not put_options:
+                    call_options = await self.get_instruments(currency=self.symbol, kind="option")
+                    if not call_options:
                         await asyncio.sleep(60)
                         continue
 
@@ -371,48 +380,28 @@ class DeltaNeutralClient(DeribitClient):
                     if position_to_add > 0:
                         logger.info(f"IV {call1_iv} triggers position increase of {position_to_add}")
                         
-                        call_price = mark_price * self.strangle_ratio['call']
-                        put_price = mark_price / self.strangle_ratio['put']
-
+                        call_price = mark_price * self.call_level
                         call_option = next((option for option in call_options if option['strike'] > call_price), None)
-                        put_option = next((option for option in put_options if option['strike'] < put_price), None)
                         
-                        if call_option and put_option:
-                            best_ask_call, _ = await self.get_order_book(call_option['instrument_name'], 1)
-                            best_ask_put, _ = await self.get_order_book(put_option['instrument_name'], 1)
-
-                            call_order_id = await self.send_order(
+                        if call_option:
+                            best_ask_price, _ = await self.get_order_book(call_option['instrument_name'], 1)
+                            order_id = await self.send_order(
                                 side="sell",
                                 order_type="limit",
                                 instrument_name=call_option["instrument_name"],
-                                price=best_ask_call,
-                                amount=position_to_add
-                            )
-
-                            put_order_id = await self.send_order(
-                                side="sell",
-                                order_type="limit",
-                                instrument_name=put_option["instrument_name"],
-                                price=best_ask_put,
+                                price=best_ask_price,
                                 amount=position_to_add
                             )
                             
-                            if call_order_id and put_order_id:
-                                await self._wait_order_fill(call_order_id, call_option["instrument_name"])
-                                await self._wait_order_fill(put_order_id, put_option["instrument_name"])
+                            if order_id:
+                                await self._wait_order_fill(order_id, call_option["instrument_name"])
                                 # Add to active positions tracking
-                                call_average_price, call_amount, _ = await self.get_position_by_instrument_name(call_option["instrument_name"])
-                                put_average_price, put_amount, _ = await self.get_position_by_instrument_name(put_option["instrument_name"])
+                                average_price, amount, _ = await self.get_position_by_instrument_name(call_option["instrument_name"])
                                 self.active_positions[call_option["instrument_name"]] = {
-                                    "entry_price": call_average_price - max(0.0003, call_average_price * 0.0003),
-                                    "amount": call_amount
+                                    "entry_price": average_price - max(0.0003, average_price * 0.0003),
+                                    "amount": amount
                                 }
-                                self.active_positions[put_option["instrument_name"]] = {
-                                    "entry_price": put_average_price - max(0.0003, put_average_price * 0.0003),
-                                    "amount": put_amount
-                                }
-                                logger.info(f"New position added: {call_option['instrument_name']}, Amount: {position_to_add}, Entry price: {best_ask_call}")
-                                logger.info(f"New position added: {put_option['instrument_name']}, Amount: {position_to_add}, Entry price: {best_ask_put}")
+                                logger.info(f"New position added: {call_option['instrument_name']}, Amount: {position_to_add}, Entry price: {best_ask_price}")
                     
                     await asyncio.sleep(60)  # Check every minute
                     
@@ -423,6 +412,30 @@ class DeltaNeutralClient(DeribitClient):
             # Ensure proper cleanup
             await self.shutdown()
 
-    # == Monitor account delta to hedge==
-    async def monitor_delta(self):
-        pass
+if __name__ == "__main__":
+    symbol = "ETH"
+    position_thresholds = {
+        60: 0.5,  # 半仓
+        70: 1.0,  # 满仓
+        90: 1.5,  # 1.5倍杠杆
+        120: 2.0  # 2倍杠杆
+    }
+    stop_loss_multiplier = 4.0
+    call_level = 1.2
+    cover_call_client = CoverCallClient(
+        symbol=symbol,
+        position_thresholds=position_thresholds,
+        stop_loss_multiplier=stop_loss_multiplier,
+        call_level=call_level
+    )
+    
+    try:
+        asyncio.run(cover_call_client.execute())
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down...")
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+    finally:
+        # Ensure the event loop is properly closed
+        loop = asyncio.get_event_loop()
+        loop.close()
