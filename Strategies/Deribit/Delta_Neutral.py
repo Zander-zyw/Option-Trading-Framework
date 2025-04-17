@@ -116,22 +116,27 @@ class DeltaNeutralClient(DeribitClient):
     
     # Wait until the next Friday 8:30 UTC or execute directly if past
     async def _wait_until_execution(self):
+        """Wait until next Friday at 8:30 UTC"""
         now = datetime.now(timezone.utc)
- 
-        # Calculate next Friday
-        days_until_friday = (4 - now.weekday()) % 7  # Friday is the 4th day of the week
-        next_friday = now.date() + timedelta(days=days_until_friday)
-        execution_time = datetime.combine(next_friday, time(8, 30), timezone.utc)
-
-        # If current time is past this week's Friday 8:30 UTC, move to the next week
-        if now >= execution_time:
-            execution_time += timedelta(days=7)
-
-        # Calculate the waiting time
-        wait_seconds = (execution_time - now).total_seconds()
-
-        logger.info(f"Waiting until next Friday 8:30 UTC. Remaining seconds: {wait_seconds}")
-        await asyncio.sleep(wait_seconds)
+        
+        # Calculate days until next Friday (0 = Monday, 1 = Tuesday, ..., 4 = Friday)
+        days_until_friday = (4 - now.weekday()) % 7
+        if days_until_friday == 0 and now.hour < 8 or (now.hour == 8 and now.minute < 30):
+            # If it's Friday before 8:30 UTC, wait until 8:30
+            days_until_friday = 0
+        elif days_until_friday == 0:
+            # If it's Friday after 8:30 UTC, wait until next Friday
+            days_until_friday = 7
+        
+        # Calculate next execution time
+        next_execution = now.replace(hour=8, minute=30, second=0, microsecond=0) + timedelta(days=days_until_friday)
+        
+        # Calculate seconds to wait
+        seconds_to_wait = (next_execution - now).total_seconds()
+        
+        if seconds_to_wait > 0:
+            logger.info(f"Waiting until {next_execution} UTC ({seconds_to_wait/3600:.2f} hours)")
+            await asyncio.sleep(seconds_to_wait)
 
     # == Get account summary ==
     async def get_account_summary(self, currency, extended=True):
@@ -320,6 +325,83 @@ class DeltaNeutralClient(DeribitClient):
     async def deactivate_hedging(self):
         self.is_hedging = False
 
+        # == Monitor account delta to hedge ==
+    async def monitor_delta(self):
+        """Monitor and hedge delta exposure"""
+        while self.is_running:
+            try:
+                # Check if hedging is activated
+                if not self.is_hedging:
+                    logger.info("Hedging is not activated, skipping delta check")
+                    await asyncio.sleep(60)
+                    continue
+
+                # Calculate total delta exposure from active positions
+                total_delta = 0
+                for instrument_name, position in self.active_positions.items():
+                    # Get option details including delta
+                    option_details = await self.get_instrument_details(instrument_name)
+                    if option_details:
+                        delta = option_details.get('delta', 0)
+                        total_delta += delta * position['amount']
+
+                logger.info(f"Current total delta exposure: {total_delta}")
+
+                # Get next Friday's date
+                friday_perpetual_name = f"{self.symbol}-{self._get_next_expiry().strftime('%-d%b%y').upper()}"
+                
+                # Get current perpetual position
+                for p in self.active_positions:
+                    if p == friday_perpetual_name:
+                        current_perpetual_size = self.active_positions[p]['amount']
+                    else:
+                        current_perpetual_size = 0
+                    break
+
+                # Calculate required hedge
+                position_delta = total_delta + current_perpetual_size
+
+                if position_delta > self.hedging_threshold:
+                    # Need to short perpetual to hedge positive delta
+                    hedge_size = math.floor(position_delta / self.hedging_threshold) * self.hedging_threshold
+                    await self.send_order(
+                        side="sell",
+                        order_type="market",
+                        instrument_name=friday_perpetual_name,
+                        amount=hedge_size
+                    )
+                    # Update active positions
+                    if friday_perpetual_name in self.active_positions:
+                        self.active_positions[friday_perpetual_name]['amount'] -= hedge_size
+                    else:
+                        self.active_positions[friday_perpetual_name] = {'amount': -hedge_size}
+                    logger.info(f"Hedging positive delta: shorting {hedge_size} {self.symbol} in {friday_perpetual_name}")
+                
+                elif position_delta < -self.hedging_threshold:
+                    # Need to long perpetual to hedge negative delta
+                    hedge_size = math.floor(abs(position_delta) / self.hedging_threshold) * self.hedging_threshold
+                    await self.send_order(
+                        side="buy",
+                        order_type="market",
+                        instrument_name=friday_perpetual_name,
+                        amount=hedge_size
+                    )
+                    # Update active positions
+                    if friday_perpetual_name in self.active_positions:
+                        self.active_positions[friday_perpetual_name]['amount'] += hedge_size
+                    else:
+                        self.active_positions[friday_perpetual_name] = {'amount': hedge_size}
+                    logger.info(f"Hedging negative delta: longing {hedge_size} {self.symbol} in {friday_perpetual_name}")
+
+                # Save state after each hedge operation
+                await self.save_state()
+
+                await asyncio.sleep(3600)  # Check every hour
+
+            except Exception as e:
+                logger.error(f"Error in delta monitoring: {str(e)}")
+                await asyncio.sleep(3600)
+
     # == Execute the strategy ==
     async def execute(self):
         await self.connect()
@@ -333,6 +415,12 @@ class DeltaNeutralClient(DeribitClient):
         try:
             while self.is_running:
                 try:
+                    # Wait until next Friday 8:30 UTC
+                    await self._wait_until_execution()
+                    
+                    # Deactivate hedging
+                    await self.deactivate_hedging()
+
                     # Get account equity
                     equity = await self.get_account_summary(currency=self.symbol)
                     if not equity:
@@ -340,12 +428,9 @@ class DeltaNeutralClient(DeribitClient):
                         await asyncio.sleep(60)
                         continue
 
-                    # Get current positions
-                    current_position = await self.get_positions(currency=self.symbol, kind="option")
-                    if current_position is None:
-                        logger.error("Failed to get current positions")
-                        await asyncio.sleep(60)
-                        continue
+                    # Calculate position size based on 1x leverage
+                    position_size = 0.5 * equity * self.leverage  # 1x leverage
+                    position_size = math.floor(position_size / self.base_amount) * self.base_amount
 
                     # Get the mark price for the next expiry date
                     instrument_name = f"{self.symbol}-{self._get_next_expiry().strftime('%-d%b%y').upper()}"
@@ -361,7 +446,7 @@ class DeltaNeutralClient(DeribitClient):
                         continue
 
                     # Find the first call option with strike price above mark price
-                    call1 = next((option for option in call_options if option['strike'] > mark_price), None)      
+                    call1 = next((option for option in call_options if option['strike'] > mark_price), None)
 
                     if not call1:
                         logger.error("No suitable options found for cover call strategy")
@@ -374,59 +459,57 @@ class DeltaNeutralClient(DeribitClient):
                         await asyncio.sleep(60)
                         continue
                     
-                    logger.info(f"Current IV: {call1_iv}, Current Position: {current_position}, Equity: {equity}")
+                    logger.info(f"Current IV: {call1_iv}, Equity: {equity}")
                     
-                    # Calculate target position based on IV
-                    position_to_add = await self.calculate_target_position(call1_iv, current_position, equity)
+                    # Place strangle orders
+                    call_price = mark_price * self.strangle_ratio['call']
+                    put_price = mark_price / self.strangle_ratio['put']
+
+                    call_option = next((option for option in call_options if option['strike'] > call_price), None)
+                    put_option = next((option for option in put_options if option['strike'] < put_price), None)
                     
-                    if position_to_add > 0:
-                        logger.info(f"IV {call1_iv} triggers position increase of {position_to_add}")
+                    if call_option and put_option:
+                        best_ask_call, _ = await self.get_order_book(call_option['instrument_name'], 1)
+                        best_ask_put, _ = await self.get_order_book(put_option['instrument_name'], 1)
+
+                        call_order_id = await self.send_order(
+                            side="sell",
+                            order_type="limit",
+                            instrument_name=call_option["instrument_name"],
+                            price=best_ask_call,
+                            amount=position_size
+                        )
+
+                        put_order_id = await self.send_order(
+                            side="sell",
+                            order_type="limit",
+                            instrument_name=put_option["instrument_name"],
+                            price=best_ask_put,
+                            amount=position_size
+                        )
                         
-                        call_price = mark_price * self.strangle_ratio['call']
-                        put_price = mark_price / self.strangle_ratio['put']
+                        if call_order_id and put_order_id:
+                            await self._wait_order_fill(call_order_id, call_option["instrument_name"], put_order_id, put_option["instrument_name"])
 
-                        call_option = next((option for option in call_options if option['strike'] > call_price), None)
-                        put_option = next((option for option in put_options if option['strike'] < put_price), None)
-                        
-                        if call_option and put_option:
-                            best_ask_call, _ = await self.get_order_book(call_option['instrument_name'], 1)
-                            best_ask_put, _ = await self.get_order_book(put_option['instrument_name'], 1)
+                            # Activate hedging
+                            await self.activate_hedging()
 
-                            call_order_id = await self.send_order(
-                                side="sell",
-                                order_type="limit",
-                                instrument_name=call_option["instrument_name"],
-                                price=best_ask_call,
-                                amount=position_to_add
-                            )
+                            # Add to active positions tracking
+                            call_average_price, call_amount, _ = await self.get_position_by_instrument_name(call_option["instrument_name"])
+                            put_average_price, put_amount, _ = await self.get_position_by_instrument_name(put_option["instrument_name"])
+                            self.active_positions[call_option["instrument_name"]] = {
+                                "entry_price": call_average_price - max(0.0003, call_average_price * 0.0003),
+                                "amount": call_amount
+                            }
+                            self.active_positions[put_option["instrument_name"]] = {
+                                "entry_price": put_average_price - max(0.0003, put_average_price * 0.0003),
+                                "amount": put_amount
+                            }
+                            logger.info(f"New position added: {call_option['instrument_name']}, Amount: {position_size}, Entry price: {best_ask_call}")
+                            logger.info(f"New position added: {put_option['instrument_name']}, Amount: {position_size}, Entry price: {best_ask_put}")
 
-                            put_order_id = await self.send_order(
-                                side="sell",
-                                order_type="limit",
-                                instrument_name=put_option["instrument_name"],
-                                price=best_ask_put,
-                                amount=position_to_add
-                            )
-                            
-                            if call_order_id and put_order_id:
-                                await self._wait_order_fill(call_order_id, call_option["instrument_name"], put_order_id, put_option["instrument_name"])
-
-                                # Add to active positions tracking
-                                call_average_price, call_amount, _ = await self.get_position_by_instrument_name(call_option["instrument_name"])
-                                put_average_price, put_amount, _ = await self.get_position_by_instrument_name(put_option["instrument_name"])
-                                self.active_positions[call_option["instrument_name"]] = {
-                                    "entry_price": call_average_price - max(0.0003, call_average_price * 0.0003),
-                                    "amount": call_amount
-                                }
-                                self.active_positions[put_option["instrument_name"]] = {
-                                    "entry_price": put_average_price - max(0.0003, put_average_price * 0.0003),
-                                    "amount": put_amount
-                                }
-                                logger.info(f"New position added: {call_option['instrument_name']}, Amount: {position_to_add}, Entry price: {best_ask_call}")
-                                logger.info(f"New position added: {put_option['instrument_name']}, Amount: {position_to_add}, Entry price: {best_ask_put}")
-
-                                # save state
-                                await self.save_state()
+                            # save state
+                            await self.save_state()
                     
                     await asyncio.sleep(60)  # Check every minute
                     
@@ -436,7 +519,3 @@ class DeltaNeutralClient(DeribitClient):
         finally:
             # Ensure proper cleanup
             await self.shutdown()
-
-    # == Monitor account delta to hedge==
-    async def monitor_delta(self):
-        pass
