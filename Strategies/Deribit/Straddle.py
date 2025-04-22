@@ -2,523 +2,288 @@
 import sys
 import os
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(BASE_DIR)
 
 from Deribit.DeribitClient import DeribitClient
 from Logger.Logger import logger
 ### import DeribitClient ###
 
-from datetime import datetime, timedelta, timezone, time
-import asyncio
-import math
 import json
 import signal
+import argparse
+import asyncio
+import math
+
+from datetime import datetime, timedelta, timezone
 
 class StraddleClient(DeribitClient):
-    def __init__(self, symbol, side, leverage):
+    def __init__(self, symbol: str, side: str, leverage: float):
         super().__init__()
-        self.symbol = symbol
-        self.side = side
+        self.symbol = symbol.upper()
+        self.side = side.lower()
         self.leverage = leverage
+        self.base_amount = {'BTC': 0.1, 'ETH': 1.0}.get(self.symbol, 0.01)
 
-        if self.symbol == "BTC":
-            self.base_amount = 0.1
-        elif self.symbol == "ETH":
-            self.base_amount = 1
-
-        self.is_running = True
+        # trading state
         self.active_positions = {}
-        self.position_monitor = None
-        self._setup_signal_handlers()
-        
-        # Account monitoring variables
-        self.peak_equity = None
-        self.initial_equity = None
         self.weekly_initial_equity = None
-    
-    def _setup_signal_handlers(self):
-        """Setup signal handlers for graceful shutdown"""
-        if sys.platform != 'win32':  # Windows doesn't support SIGINT properly
-            signal.signal(signal.SIGINT, self._signal_handler)
-            signal.signal(signal.SIGTERM, self._signal_handler)
+        self.peak_equity = None
 
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-        self.is_running = False
+        # asyncio control
+        self._shutdown_event = asyncio.Event()
+        self._tasks = []
 
+    # ----- Deribit Straddle API wrappers -----
+    async def ticker(self, instrument_name: str) -> float:
+        resp = await super().ticker(instrument_name=instrument_name)
+        if resp and resp.get('result'):
+            return resp['result']['mark_price']
+        logger.error(f"ticker() failed for {instrument_name}: {resp}")
+        return None
+
+    async def get_instruments(self, currency: str, kind: str):
+        resp = await super().get_instruments(currency=currency, kind=kind)
+        if resp and resp.get('result'):
+            instruments = resp['result']
+            target_ts = int(self._next_friday().timestamp() * 1000)
+            calls = [i for i in instruments if i['expiration_timestamp'] == target_ts and i['option_type'] == 'call']
+            puts  = [i for i in instruments if i['expiration_timestamp'] == target_ts and i['option_type'] == 'put']
+            return calls, puts
+        logger.error(f"get_instruments() failed: {resp}")
+        return [], []
+
+    async def get_order_book(self, instrument_name: str, depth: int = 1):
+        resp = await super().get_order_book(instrument_name=instrument_name, depth=depth)
+        if resp and resp.get('result'):
+            return resp['result']['best_ask_price'], resp['result']['best_bid_price']
+        logger.error(f"get_order_book() failed for {instrument_name}: {resp}")
+        return None, None
+
+    async def get_position_by_instrument_name(self, instrument_name: str):
+        resp = await super().get_position_by_instrument_name(instrument_name=instrument_name)
+        if resp and resp.get('result'):
+            r = resp['result']
+            return r['average_price'], r['size'], r['mark_price']
+        logger.error(f"get_position_by_instrument_name() failed: {resp}")
+        return None, 0, None
+
+    async def get_account_summary(self, currency: str, extended: bool = True) -> float:
+        resp = await super().get_account_summary(currency=currency, extended=extended)
+        if resp and resp.get('result'):
+            return resp['result']['equity']
+        logger.error(f"get_account_summary() failed: {resp}")
+        return None
+
+    async def send_order(self, side: str, order_type: str, instrument_name: str, price: float, amount: float) -> str:
+        resp = await super().send_order(side=side, order_type=order_type,
+                                        instrument_name=instrument_name,
+                                        price=price, amount=amount)
+        if resp and resp.get('result') and resp['result'].get('order'):
+            return resp['result']['order']['order_id']
+        logger.error(f"send_order() failed: {resp}")
+        return None
+
+    async def get_order_state(self, order_id: str) -> int:
+        resp = await super().get_order_state(order_id)
+        if resp and resp.get('result'):
+            res = resp['result']
+            return res['amount'] - res['filled_amount']
+        logger.error(f"get_order_state() failed: {resp}")
+        return None
+
+    # ----- State persistence -----
     async def save_state(self):
-        """Save current state to file"""
+        os.makedirs(BASE_DIR, exist_ok=True)
+        path = os.path.join(BASE_DIR, f'straddle_{self.symbol}.json')
+        data = {
+            'active_positions': self.active_positions,
+            'weekly_initial_equity': self.weekly_initial_equity,
+            'peak_equity': self.peak_equity,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
         try:
-            state = {
-                'active_positions': self.active_positions,
-                'peak_equity': self.peak_equity,
-                'initial_equity': self.initial_equity,
-                'weekly_initial_equity': self.weekly_initial_equity,
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
-            
-            state_file = os.path.join(BASE_DIR, 'State', f'straddle_state_{self.symbol}.json')
-            os.makedirs(os.path.dirname(state_file), exist_ok=True)
-            
-            with open(state_file, 'w') as f:
-                json.dump(state, f, indent=4)
-            
-            logger.info(f"State saved to {state_file}")
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+            logger.info(f"State saved: {path}")
         except Exception as e:
-            logger.error(f"Failed to save state: {str(e)}")
+            logger.error(f"save_state failed: {e}")
 
     async def load_state(self):
-        """Load saved state from file"""
+        path = os.path.join(BASE_DIR, f'straddle_{self.symbol}.json')
+        if not os.path.exists(path):
+            logger.info("No previous state, starting fresh")
+            return
         try:
-            state_file = os.path.join(BASE_DIR, 'State', f'straddle_state_{self.symbol}.json')
-            if os.path.exists(state_file):
-                with open(state_file, 'r') as f:
-                    state = json.load(f)
-                    self.active_positions = state.get('active_positions', {})
-                    self.peak_equity = state.get('peak_equity')
-                    self.initial_equity = state.get('initial_equity')
-                    self.weekly_initial_equity = state.get('weekly_initial_equity')
-                    logger.info(f"Loaded state from {state_file}")
-            else:
-                logger.info(f"No existing state file found at {state_file}, starting fresh")
-                self.active_positions = {}
-                self.peak_equity = None
-                self.initial_equity = None
-                self.weekly_initial_equity = None
+            with open(path) as f:
+                s = json.load(f)
+            self.active_positions = s.get('active_positions', {})
+            self.weekly_initial_equity = s.get('weekly_initial_equity')
+            self.peak_equity = s.get('peak_equity')
+            logger.info(f"State loaded: {path}")
         except Exception as e:
-            logger.error(f"Failed to load state: {str(e)}")
-            logger.info("Starting with fresh state")
-            self.active_positions = {}
-            self.peak_equity = None
-            self.initial_equity = None
-            self.weekly_initial_equity = None
+            logger.error(f"load_state failed: {e}")
 
-    async def shutdown(self):
-        """Graceful shutdown procedure"""
-        logger.info("Starting shutdown procedure...")
-        
-        # Stop the main loop
-        self.is_running = False
-        
-        # Cancel position monitoring task if it exists
-        if self.position_monitor:
-            self.position_monitor.cancel()
-            try:
-                await self.position_monitor
-            except asyncio.CancelledError:
-                pass
-        
-        # Save current state
-        await self.save_state()
-        
-        # Disconnect from exchange
-        await self.disconnect()
-        
-        logger.info("Shutdown completed")
-    
-    # get the next expiry date for the given symbol
-    def _get_next_expiry(self):
-        today = datetime.now(timezone.utc)
-        days_until_friday = (4 - today.weekday()) % 7  # friday is 4
-        if days_until_friday == 0: # today is Friday
-            next_friday = today + timedelta(days=7)  # next week's Friday
-        else: # today is not Friday
-            next_friday = today + timedelta(days=days_until_friday)
-            
-        return next_friday
-    
-    # Wait until the next Friday 8:00 UTC or execute directly if past
-    async def _wait_until_execution(self):
-        now = datetime.now(timezone.utc)
- 
-        # Calculate next Friday
-        days_until_friday = (4 - now.weekday()) % 7  # Friday is the 4th day of the week
-        next_friday = now.date() + timedelta(days=days_until_friday)
-        execution_time = datetime.combine(next_friday, time(8, 30), timezone.utc)
+    # ----- Position management -----
+    async def close_positions(self, current_equity: float, ratio: float = 1.0):
+        pos = list(self.active_positions.items())
+        if len(pos) != 2:
+            logger.error(f"Expected 2 positions, got {len(pos)}")
+            return
+        call_inst, call_info = next(p for p in pos if p[0].endswith('C'))
+        put_inst, put_info   = next(p for p in pos if p[0].endswith('P'))
 
-        # If current time is past this week's Friday 8:00 UTC, move to the next week
-        if now >= execution_time:
-            execution_time += timedelta(days=7)
+        ask_c, bid_c = await self.get_order_book(call_inst)
+        ask_p, bid_p = await self.get_order_book(put_inst)
+        close_side = 'sell' if self.side == 'buy' else 'buy'
+        price_c = bid_c if close_side == 'sell' else ask_c
+        price_p = bid_p if close_side == 'sell' else ask_p
 
-        # Calculate the waiting time
-        wait_seconds = (execution_time - now).total_seconds()
+        amt_c = math.floor(abs(call_info['amount']) * ratio / self.base_amount) * self.base_amount
+        amt_p = math.floor(abs(put_info ['amount']) * ratio / self.base_amount) * self.base_amount
 
-        logger.info(f"Waiting until next Friday 8:30 UTC. Remaining seconds: {wait_seconds}")
-        await asyncio.sleep(wait_seconds)
+        id_c = await self.send_order(close_side, 'limit', call_inst, price_c, amt_c)
+        id_p = await self.send_order(close_side, 'limit', put_inst,  price_p, amt_p)
 
-    # Wait until order is filled
-    async def _wait_order_fill(self, call_order_id, put_order_id, call_order_name, put_order_name):
-        start_time = datetime.now()
-        timeout = 3600
-
-        while self.is_running:
-            remaining_call = await self.get_order_state(call_order_id)
-            remaining_put = await self.get_order_state(put_order_id)
-
-            if remaining_call == 0 and remaining_put == 0:
-                logger.info(f"Both call and put orders have been filled.")
-                break
-
-            if (datetime.now() - start_time).total_seconds() <= timeout:
-                # Handle call order
-                if remaining_call > 0:
-                    await self.cancel_order(call_order_id)
-                    best_ask, _ = await self.get_order_book(call_order_name)
-                    call_order_id = await self.send_order(side=self.side, order_type="limit", instrument_name=call_order_name, price=best_ask, amount=remaining_call)
-                
-                # Handle put order
-                if remaining_put > 0:
-                    await self.cancel_order(put_order_id)
-                    best_ask, _ = await self.get_order_book(put_order_name)
-                    put_order_id = await self.send_order(side=self.side, order_type="limit", instrument_name=put_order_name, price=best_ask, amount=remaining_put)
-
+        if id_c and id_p:
+            await self._wait_order_fill(id_c, id_p, call_inst, put_inst)
+            if ratio == 1.0:
+                self.active_positions.clear()
             else:
-                # Handle call order
-                if remaining_call > 0:
-                    await self.cancel_order(call_order_id)
-                    _, best_bid = await self.get_order_book(call_order_name)
-                    call_order_id = await self.send_order(side=self.side, order_type="limit", instrument_name=call_order_name, price=best_bid, amount=remaining_call)
-                
-                # Handle put order
-                if remaining_put > 0:
-                    await self.cancel_order(put_order_id)
-                    _, best_bid = await self.get_order_book(put_order_name)
-                    put_order_id = await self.send_order(side=self.side, order_type="limit", instrument_name=put_order_name, price=best_bid, amount=remaining_put)
-            
+                self.active_positions[call_inst]['amount'] -= amt_c
+                self.active_positions[put_inst]['amount']  -= amt_p
+            logger.info(f"Closed positions at ratio={ratio}")
+        await self.save_state()
+
+    async def _wait_order_fill(self, call_id: str, put_id: str, call_name: str, put_name: str):
+        timeout = 3600
+        start = datetime.now()
+        while not self._shutdown_event.is_set():
+            rem_c = await self.get_order_state(call_id)
+            rem_p = await self.get_order_state(put_id)
+            if rem_c == 0 and rem_p == 0:
+                return
+            elapsed = (datetime.now() - start).total_seconds()
+            # repricing logic
+            side = self.side
+            if elapsed < timeout:
+                if rem_c > 0:
+                    await super().cancel_order(call_id)
+                    ask, _ = await self.get_order_book(call_name)
+                    call_id = await self.send_order(side, 'limit', call_name, ask, rem_c)
+                if rem_p > 0:
+                    await super().cancel_order(put_id)
+                    ask, _ = await self.get_order_book(put_name)
+                    put_id  = await self.send_order(side, 'limit', put_name, ask, rem_p)
+            else:
+                if rem_c > 0:
+                    await super().cancel_order(call_id)
+                    _, bid = await self.get_order_book(call_name)
+                    call_id = await self.send_order(side, 'limit', call_name, bid, rem_c)
+                if rem_p > 0:
+                    await super().cancel_order(put_id)
+                    _, bid = await self.get_order_book(put_name)
+                    put_id  = await self.send_order(side, 'limit', put_name, bid, rem_p)
             await asyncio.sleep(60)
 
-    # Get the remaining amount of an order
-    async def get_order_state(self, order_id):
-        response = await super().get_order_state(order_id)
+    # ----- Scheduler -----
+    def _next_friday(self) -> datetime:
+        now = datetime.now(timezone.utc)
+        days = (4 - now.weekday()) % 7 or 7
+        return (now + timedelta(days=days)).replace(hour=8, minute=30, second=0, microsecond=0)
 
-        return response["result"]["amount"] - response["result"]["filled_amount"]
+    async def _weekly_task(self):
+        while not self._shutdown_event.is_set():
+            next_run = self._next_friday()
+            delay = (next_run - datetime.now(timezone.utc)).total_seconds()
+            logger.info(f"Sleeping {int(delay)}s until Friday 08:30 UTC...")
+            await asyncio.sleep(max(0, delay))
+            if self._shutdown_event.is_set(): break
+            await self._execute_once()
 
-    # Get the mark price for the next expiry date
-    async def ticker(self, instrument_name: str):
-        response = await super().ticker(instrument_name=instrument_name)
-
-        if response:
-            symbol_mark_px = response["result"]["mark_price"]
-            logger.info(f"Mark price for {instrument_name}: {symbol_mark_px}")
-            return symbol_mark_px
-        else:
-            logger.error(f"Failed to get ticker for {instrument_name}")
-            return None
-        
-    # Get the option chain for the next expiry date
-    async def get_instruments(self, currency, kind):
-        response = await super().get_instruments(currency, kind)
-
-        if response:
-            instruments = response["result"]
-
-            # Filter for options expiring next Friday
-            next_friday = self._get_next_expiry()
-            next_friday_utc8 = next_friday.replace(hour=8, minute=0, second=0, microsecond=0)
-            next_friday_timestamp = int(next_friday_utc8.timestamp() * 1000)
-
-            call_options = [
-                instrument for instrument in instruments
-                if instrument['expiration_timestamp'] == next_friday_timestamp and instrument['option_type'] == 'call'
-            ]
-            put_options = [
-                instrument for instrument in instruments
-                if instrument['expiration_timestamp'] == next_friday_timestamp and instrument['option_type'] == 'put'
-            ]
-
-            return call_options, put_options
-        else:
-            logger.error("Failed to get instruments")
-            return None, None
-        
-    async def get_order_book(self, instrument_name, depth):
-        response = await super().get_order_book(instrument_name, depth)
-
-        best_ask = response["result"]["best_ask_price"]
-        best_bid = response["result"]["best_bid_price"]
-        logger.info(f"Best ask price for {instrument_name}: {best_ask}")
-        logger.info(f"Best bid price for {instrument_name}: {best_bid}")
-
-        return best_ask, best_bid
-
-    async def get_position_by_instrument_name(self, instrument_name):
-        response = await super().get_position_by_instrument_name(instrument_name)
-
-        if response:
-            return response["result"]["average_price"], response["result"]["size"], response["result"]["mark_price"]
-        else:
-            return None
-
-    async def get_account_summary(self, currency, extended=True):
-        response = await super().get_account_summary(currency, extended)
-
-        if response:
-            return response["result"]["equity"]
-        else:
-            return None
-
-    async def send_order(self, side, order_type, instrument_name, price, amount):
-        response = await super().send_order(side, order_type, instrument_name, price, amount)
-
-        if response:
-            return response['result']['order']['order_id']
-        else:
-            return None
-
-    async def close_positions(self, current_equity, ratio=1.0):
-        """Close positions with specified ratio (1.0 for all positions)"""
-        # Get all active positions
-        positions = list(self.active_positions.items())
-        if len(positions) != 2:  # Should have exactly 2 positions (call and put)
-            logger.error(f"Unexpected number of positions: {len(positions)}")
+    async def _execute_once(self):
+        expiry = self._next_friday()
+        code = expiry.strftime('%d%b%y').upper()
+        inst = f"{self.symbol}-{code}"
+        mark = await self.ticker(inst)
+        if mark is None: return
+        calls, puts = await self.get_instruments(self.symbol, 'option')
+        call = next((o for o in calls if o['strike'] > mark), None)
+        put  = next((o for o in puts  if o['strike'] > mark), None)
+        if not call or not put:
+            logger.error("No suitable options")
             return
-
-        # Check if the instrument name ends with "C" or "P"
-        for instrument_name, position_info in positions:
-            if instrument_name.endswith("C"):
-                call_instrument = instrument_name
-                call_info = position_info
-            else:
-                put_instrument = instrument_name
-                put_info = position_info
-
-        try:
-            # Get order book for both options
-            call_best_ask, call_best_bid = await self.get_order_book(call_instrument, 1)
-            put_best_ask, put_best_bid = await self.get_order_book(put_instrument, 1)
-            
-            # Use best_bid for buy positions and best_ask for sell positions
-            call_close_price = call_best_ask if self.side == "buy" else call_best_bid
-            put_close_price = put_best_ask if self.side == "buy" else put_best_bid
-            
-            # Calculate close amount
-            call_close_amount = abs(call_info["amount"]) * ratio
-            put_close_amount = abs(put_info["amount"]) * ratio
-            
-            # Round to base amount
-            call_close_amount = math.floor(call_close_amount / self.base_amount) * self.base_amount
-            put_close_amount = math.floor(put_close_amount / self.base_amount) * self.base_amount
-            
-            # Send close orders for both positions
-            call_order_id = await self.send_order(
-                side="sell" if self.side == "buy" else "buy",
-                order_type="limit",
-                instrument_name=call_instrument,
-                price=call_close_price,
-                amount=call_close_amount
-            )
-            
-            put_order_id = await self.send_order(
-                side="sell" if self.side == "buy" else "buy",
-                order_type="limit",
-                instrument_name=put_instrument,
-                price=put_close_price,
-                amount=put_close_amount
-            )
-            
-            if call_order_id and put_order_id:
-                await self._wait_order_fill(call_order_id, put_order_id, call_instrument, put_instrument)
-                logger.info(f"Positions closed - Call: {call_instrument} at {call_close_price}, "
-                          f"Put: {put_instrument} at {put_close_price}")
-                
-                if ratio == 1.0:
-                    # Remove positions if closing all
-                    del self.active_positions[call_instrument]
-                    del self.active_positions[put_instrument]
-                else:
-                    # Update remaining positions
-                    self.active_positions[call_instrument]["amount"] -= call_close_amount
-                    self.active_positions[put_instrument]["amount"] -= put_close_amount
-        
-        except Exception as e:
-            logger.error(f"Error closing positions: {str(e)}")
-            return
-        
-        # Save state after closing positions
-        await self.save_state()
-        
-        # Update peak equity
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
+        ask_c, _ = await self.get_order_book(call['instrument_name'])
+        ask_p, _ = await self.get_order_book(put ['instrument_name'])
+        equity = await self.get_account_summary(self.symbol)
+        size = math.floor(0.5 * equity * self.leverage / self.base_amount) * self.base_amount
+        id_c = await self.send_order(self.side, 'limit', call['instrument_name'], ask_c, size)
+        id_p = await self.send_order(self.side, 'limit', put['instrument_name'], ask_p, size)
+        if id_c and id_p:
+            await self._wait_order_fill(id_c, id_p, call['instrument_name'], put['instrument_name'])
+            c_px, c_sz, _ = await self.get_position_by_instrument_name(call['instrument_name'])
+            p_px, p_sz, _ = await self.get_position_by_instrument_name(put['instrument_name'])
+            fee = 0.0003
+            self.active_positions = {
+                call ['instrument_name']: {'entry_price': c_px * (1 - max(fee, fee*c_sz)), 'amount': c_sz},
+                put  ['instrument_name']: {'entry_price': p_px * (1 - max(fee, fee*p_sz)), 'amount': p_sz}
+            }
+            self.weekly_initial_equity = self.peak_equity = equity
             await self.save_state()
+            logger.info("Executed straddle and reset state.")
 
-    async def monitor_positions(self):
-        while self.is_running:
-            try:
-                # Get current account equity
-                current_equity = await self.get_account_summary(currency=self.symbol)
-                if not current_equity:
-                    await asyncio.sleep(60)
-                    continue
-
-                # Initialize peak equity if not set
-                if self.peak_equity is None:
-                    self.peak_equity = current_equity
-                    self.initial_equity = current_equity
-                    await self.save_state()
-
-                # Update peak equity if current equity is higher
-                if current_equity > self.peak_equity:
-                    self.peak_equity = current_equity
-                    await self.save_state()
-
-                # Check if it's UTC Friday 8:00 (new week)
-                now = datetime.now(timezone.utc)
-                is_friday_8am = now.weekday() == 4 and now.hour == 8 and now.minute < 1  # Friday 8:00 UTC
-                
-                if self.weekly_initial_equity is None or is_friday_8am:
-                    self.weekly_initial_equity = current_equity
-                    await self.save_state()
-                    logger.info(f"New week started at {now} - Weekly initial equity: {self.weekly_initial_equity}")
-
-                # Calculate weekly return
-                weekly_return = (current_equity - self.weekly_initial_equity) / self.weekly_initial_equity
-                
-                logger.info(f"Account Equity: {current_equity}, Weekly Initial Equity: {self.weekly_initial_equity}, "
-                          f"Weekly Return: {weekly_return*100:.2f}%")
-
-                # Check for take profit conditions
-                if weekly_return >= 0.01:  # 1% weekly return
-                    logger.info(f"Take profit triggered at weekly return {weekly_return*100:.2f}% - Closing all positions")
-                    await self.close_positions(current_equity, ratio=1.0)
-                elif weekly_return >= 0.008:  # 0.8% weekly return
-                    logger.info(f"Partial take profit triggered at weekly return {weekly_return*100:.2f}% - Closing 50% of positions")
-                    await self.close_positions(current_equity, ratio=0.5)
-
-                # Check if drawdown exceeds 1%
-                drawdown = (self.peak_equity - current_equity) / self.peak_equity
-                
-                logger.info(f"Account Equity: {current_equity}, Peak Equity: {self.peak_equity}, "
-                          f"Drawdown: {drawdown*100:.2f}%")
-                
-                if drawdown >= 0.01:  # 1% drawdown
-                    logger.warning(f"Account stop loss triggered at equity {current_equity} "
-                                f"(Drawdown: {drawdown*100:.2f}%)")
-                    await self.close_positions(current_equity, ratio=1.0)
-                
-                await asyncio.sleep(60)  # Check every 60 seconds
-                
-            except Exception as e:
-                logger.error(f"Error in account monitoring: {str(e)}")
+    async def _monitor_task(self):
+        while not self._shutdown_event.is_set():
+            eq = await self.get_account_summary(self.symbol)
+            if eq is None:
                 await asyncio.sleep(60)
+                continue
+            # init
+            if self.weekly_initial_equity is None:
+                self.weekly_initial_equity = eq
+                self.peak_equity = eq
+                await self.save_state()
+            # update peak
+            if eq > self.peak_equity:
+                self.peak_equity = eq
+                await self.save_state()
+            ret = (eq - self.weekly_initial_equity) / self.weekly_initial_equity
+            dd  = (self.peak_equity - eq) / self.peak_equity
+            if ret >= 0.01:
+                logger.info("1% weekly return reached")
+                await self.close_positions(eq, 1.0)
+            elif ret >= 0.008:
+                logger.info("0.8% weekly return reached")
+                await self.close_positions(eq, 0.5)
+            if dd >= 0.01:
+                logger.warning("1% drawdown reached")
+                await self.close_positions(eq, 1.0)
+            await asyncio.sleep(60)
 
-    # Main Logic to execute the straddle strategy
-    async def execute(self):
+    async def run(self):
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, self._shutdown_event.set)
+        loop.add_signal_handler(signal.SIGTERM, self._shutdown_event.set)
+
         await self.connect()
-
-        # Load previous state
         await self.load_state()
-
-        # Start position monitoring in background
-        self.position_monitor = asyncio.create_task(self.monitor_positions())
-
-        try:
-            while self.is_running:
-                # Wait until next Friday 17:00 UTC
-                await self._wait_until_execution()
-
-                # Get account equity
-                equity = await self.get_account_summary(currency=self.symbol)
-                if not equity:
-                    logger.error("Failed to get account equity")
-                    await asyncio.sleep(60)
-                    continue
-
-                # Calculate position size based on 1x leverage
-                position_size = 0.5 * equity * self.leverage  # 1x leverage
-                position_size = math.floor(position_size / self.base_amount) * self.base_amount
-
-                # Get the mark price for the next expiry date
-                instrument_name = f"{self.symbol}-{self._get_next_expiry().strftime('%-d%b%y').upper()}"
-                mark_price = await self.ticker(instrument_name=instrument_name)
-
-                if not mark_price:
-                    await asyncio.sleep(60)
-                    continue
-
-                # Get call and put options for next week
-                call_options, put_options = await self.get_instruments(currency=self.symbol, kind="option")
-
-                if not call_options or not put_options:
-                    logger.error("No suitable options found for strangle strategy")
-                    await asyncio.sleep(60)
-                    continue
-
-                # Strangle strategy (strike price is different for call and put)
-                # For call: strike > mark price
-                # For put: strike < mark price
-                call_option = next((option for option in call_options if option['strike'] > mark_price), None)
-                put_option = next((option for option in put_options if option['strike'] < mark_price), None)
-
-                if not call_option or not put_option:
-                    logger.error("No suitable options found for strangle strategy")
-                    await asyncio.sleep(60)
-                    continue
-
-                logger.info(f"Call option: {call_option['instrument_name']}, Put option: {put_option['instrument_name']}")
-
-                # Get the order book for both options
-                call_best_ask, _ = await self.get_order_book(call_option['instrument_name'], 5)
-                put_best_ask, _ = await self.get_order_book(put_option['instrument_name'], 5)
-
-                # Execute the strangle strategy
-                call_order_id = await self.send_order(
-                    side=self.side,
-                    order_type="limit",
-                    instrument_name=call_option['instrument_name'],
-                    price=call_best_ask,
-                    amount=position_size
-                )
-                
-                put_order_id = await self.send_order(
-                    side=self.side,
-                    order_type="limit",
-                    instrument_name=put_option['instrument_name'],
-                    price=put_best_ask,
-                    amount=position_size
-                )
-
-                if call_order_id and put_order_id:
-                    await self._wait_order_fill(call_order_id, put_order_id, call_option['instrument_name'], put_option['instrument_name'])
-
-                    # Get position details after fill
-                    call_price, call_amount, _ = await self.get_position_by_instrument_name(call_option['instrument_name'])
-                    put_price, put_amount, _ = await self.get_position_by_instrument_name(put_option['instrument_name'])
-
-                    # Update active positions
-                    self.active_positions[call_option['instrument_name']] = {
-                        'entry_price': call_price - max(0.0003, call_price * 0.0003),
-                        'amount': call_amount
-                    }
-                    self.active_positions[put_option['instrument_name']] = {
-                        'entry_price': put_price - max(0.0003, put_price * 0.0003),
-                        'amount': put_amount
-                    }
-
-                    # Save state after opening new positions
-                    await self.save_state()
-
-        except Exception as e:
-            logger.error(f"Error in execution loop: {str(e)}")
-        finally:
-            await self.shutdown()
+        self._tasks = [asyncio.create_task(self._monitor_task()), asyncio.create_task(self._weekly_task())]
+        done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await self.shutdown()
 
 if __name__ == "__main__":
-    symbol = "BTC"
-    side = "sell"
-    leverage = 1.0
-    straddle_client = StraddleClient(symbol, side, leverage)
-    
+    parser = argparse.ArgumentParser(description="Deribit Straddle Strategy")
+    parser.add_argument("--symbol",   default="BTC", choices=["BTC","ETH"], help="Underlying symbol")
+    parser.add_argument("--side",     default="sell", choices=["buy","sell"], help="Direction")
+    parser.add_argument("--leverage", type=float, default=1.0, help="Leverage")
+    args = parser.parse_args()
+
+    client = StraddleClient(args.symbol, args.side, args.leverage)
     try:
-        # Execute the straddle strategy
-        asyncio.run(straddle_client.execute())
-    except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt, shutting down...")
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-    finally:
-        # Ensure the event loop is properly closed
-        loop = asyncio.get_event_loop()
-        loop.close()
+        asyncio.run(client.run())
+    except Exception as err:
+        logger.error(f"Fatal error: {err}")
+        sys.exit(1)
