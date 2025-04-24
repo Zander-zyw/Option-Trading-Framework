@@ -27,11 +27,31 @@ A strategy that sells call options when IV is high, with dynamic position sizing
 - State persistence and recovery
 - Graceful shutdown handling
 
-### 2. Straddle Strategy (Planned)
-[Strategy description to be added]
+### 2. Straddle Strategy
+A market-neutral options strategy that involves simultaneously buying a put and a call with the same strike price and expiration date.
 
-### 3. Delta Neutral Strategy (Planned)
-[Strategy description to be added]
+#### Features
+- Dynamic entry based on IV levels and term structure
+- Real-time volatility surface monitoring
+- Position sizing based on account risk parameters
+- Automatic strike selection near ATM (At-The-Money)
+- Stop-loss based on total position equity
+- Profit taking at predefined profit targets
+- State persistence and recovery
+- Graceful shutdown handling
+
+### 3. Delta Neutral Strategy
+A strategy that maintains a delta-neutral position by dynamically hedging options positions with the underlying asset.
+
+#### Features
+- Continuous delta calculation and monitoring
+- Dynamic hedge ratio adjustment
+- Automated futures hedging
+- Position correlation monitoring
+- Risk metrics tracking (Vega, Gamma, Theta)
+- State persistence and recovery
+- Graceful shutdown handling
+
 
 ## Requirements
 
@@ -40,12 +60,13 @@ A strategy that sells call options when IV is high, with dynamic position sizing
   - aiohttp>=3.8.0
   - websockets>=10.0
   - cryptography>=3.4.7
+  - python-okx>=0.3.5
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/Option-Trading-Framework.git
+git clone https://github.com/Zander-zyw/Option-Trading-Framework.git
 cd Option-Trading-Framework
 ```
 
@@ -70,28 +91,41 @@ call_level = 1.2  # Call level
 
 ## Usage
 
-### Running Cover Call Strategy
+### Running Strategies
 
-1. Start the strategy:
+1. Cover Call Strategy:
 ```bash
-python Strategies/Cover_Call.py
+python Strategies/Deribit/Cover_Call.py
 ```
 
-2. Monitor the strategy:
-- Logs are written to the configured logging destination
-- State is saved in `state/cover_call_state_{symbol}.json`
+2. Straddle Strategy:
+```bash
+python Strategies/Deribit/Straddle.py
+```
+```bash
+python Strategies/OKX/Straddle.py
+```
 
-3. Stop the strategy:
+3. Delta Neutral Strategy:
+```bash
+python Strategies/Deribit/Delta_Neutral.py
+```
+
+Monitor the strategies:
+- Logs are written to the configured logging destination
+- States are saved in `state/{strategy_name}_state_{symbol}.json`
+
+Stop a strategy:
 - Press Ctrl+C for graceful shutdown
 - Or send SIGTERM signal:
 ```bash
-pkill -f "python Strategies/Cover_Call.py"
+pkill -f "python Strategies/{exchange_name}/{strategy_name}.py"
 ```
 
 ## State Management
 
 The framework automatically:
-- Saves current positions to `state/cover_call_state_{symbol}.json`
+- Saves current positions to `state/{strategy_name}_state_{symbol}.json`
 - Loads previous state on restart
 - Maintains position tracking during runtime
 
@@ -103,6 +137,9 @@ Comprehensive logging is implemented for:
 - Error handling
 - State changes
 - Order execution
+- Risk metrics
+- Hedging activities
+- Rebalancing operations
 
 ## Contributing
 
@@ -114,4 +151,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Disclaimer
 
-This framework is for educational purposes only. Use at your own risk. Past performance is not indicative of future results.
+This framework is for educational purposes only. Use at your own risk. Past performance is not indicative of future results. Options trading involves substantial risk and is not suitable for all investors.

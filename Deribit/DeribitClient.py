@@ -84,6 +84,24 @@ class DeribitClient:
                 message_str = await self.websocket.recv()
                 message = json.loads(message_str)
                 
+                # -- Heartbeat notifications come as JSON-RPC notifications with method "heartbeat"
+                if message.get("method") == "heartbeat":
+                    params = message.get("params", {})
+                    # Server is checking that we're alive
+                    if params.get("type") == "test_request":
+                        # Respond with a public/test to acknowledge
+                        test_req = {
+                            "jsonrpc": "2.0",
+                            "id": self._generate_request_id(),
+                            "method": "public/test",
+                            "params": {}
+                        }
+                        await self.websocket.send(json.dumps(test_req))
+                        logger.info("Replied to heartbeat test_request with public/test")
+                    else:
+                        logger.info("Received heartbeat ping")
+                    continue
+
                 if "id" in message:
                     req_id = message.get("id")
                     future = self.pending_requests.pop(req_id, None)
@@ -127,6 +145,17 @@ class DeribitClient:
             # Start the read loop
             asyncio.create_task(self._read_loop())
             logger.info("Read loop started.")
+
+            # Enable server-initiated heartbeats every 30s
+            hb_msg = {
+                "jsonrpc": "2.0",
+                "id": self._generate_request_id(),
+                "method": "public/set_heartbeat",
+                "params": {"interval": 10}
+            }
+            await self.send_request(hb_msg)
+            logger.info(f"Heartbeat enabled (interval=30s).")
+
         except Exception as e:
             logger.error(f"Error connecting to WebSocket: {e}")
 
@@ -186,7 +215,7 @@ class DeribitClient:
             return None
 
     # == Send Order ==
-    async def send_order(self, side, order_type, instrument_name, price, amount):
+    async def send_order(self, side, order_type, instrument_name, price, amount, time_in_force: str = "good_till_cancelled"):
         if side not in ["buy", "sell"]:
             logger.error("Invalid order side. Must be 'buy' or 'sell'.")
             return
@@ -214,6 +243,7 @@ class DeribitClient:
                 "amount": amount,
                 "type": order_type,
                 "label": f"{side}_{order_type}_{price}_{amount}_{request_id}",
+                "time_in_force": time_in_force
             }
         }
 
@@ -429,3 +459,19 @@ class DeribitClient:
             logger.info("WebSocket connection closed manually.")
         else: 
             logger.error("No WebSocket connection to close.")
+
+# test heartbeat
+if __name__ == "__main__":
+    client = DeribitClient()
+    
+    async def main():
+        await client.connect()
+        await client.subscribe(["ticker.BTC-PERPETUAL.raw"])
+        await asyncio.sleep(120)
+        await client.disconnect()
+
+    asyncio.run(main())
+
+    
+
+    
