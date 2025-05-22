@@ -1,4 +1,4 @@
-### import DeribitClient ###
+### import Logger ###
 import sys
 import os
 
@@ -108,8 +108,8 @@ class DeribitClient:
                     if future and not future.done():
                         future.set_result(message)
                 else:
-                    # 如果是订阅推送或其他消息，则直接记录日志
-                    logger.info(f"Received message: {message}")
+                    # 如果是订阅推送或其他消息
+                    await self._handle_subscription(message)
 
             except websockets.exceptions.ConnectionClosed:
                 logger.info("WebSocket connection closed. Exiting read loop.")
@@ -117,6 +117,12 @@ class DeribitClient:
             except Exception as e:
                 logger.error(f"Error in read loop: {e}")
                 break
+
+    async def _handle_subscription(self, message):
+        """
+        处理订阅推送或其他消息
+        """
+        logger.info(f"Received message: {message}")
 
     # == Connect ==
     async def connect(self):
@@ -158,7 +164,8 @@ class DeribitClient:
 
         except Exception as e:
             logger.error(f"Error connecting to WebSocket: {e}")
-
+            raise e
+        
     # == Send Request ==
     async def send_request(self, request_msg):
         req_id = request_msg["id"]
@@ -215,7 +222,7 @@ class DeribitClient:
             return None
 
     # == Send Order ==
-    async def send_order(self, side, order_type, instrument_name, price, amount, time_in_force: str = "good_till_cancelled"):
+    async def send_order(self, side, order_type, instrument_name, price, amount, time_in_force: str = "good_til_cancelled"):
         if side not in ["buy", "sell"]:
             logger.error("Invalid order side. Must be 'buy' or 'sell'.")
             return
@@ -466,12 +473,8 @@ if __name__ == "__main__":
     
     async def main():
         await client.connect()
-        await client.subscribe(["ticker.BTC-PERPETUAL.raw"])
+        await client.subscribe(["user.orders.option.eth.raw"])
         await asyncio.sleep(120)
         await client.disconnect()
 
     asyncio.run(main())
-
-    
-
-    

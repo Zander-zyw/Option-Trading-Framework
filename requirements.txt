@@ -2,3 +2,4 @@ aiohttp>=3.8.0
 websockets>=10.0
 cryptography>=3.4.7 
 python-okx>=0.3.5
+apscheduler>=3.11.0
