@@ -78,35 +78,49 @@ class PCPArbitrage(DeribitClient):
         self.subscribed_instruments: Set[str] = set()
 
         # 保证金相关变量
-        self.allow_maker = False    # 是否允许挂单
+        self.allow_maker = False
 
         # Locks and queues
         self._arbs_lock = asyncio.Lock()
         self._update_queue: asyncio.Queue[PCPPair] = asyncio.Queue()
-        self._arb_available = asyncio.Event()  # 用于启动挂单任务
+        self._arb_available = asyncio.Event()
 
         # 当前套利机会存储
         self.active_arbs: Dict[str, Dict] = {}
         self.archived_arbs: Dict[str, Dict] = {}
 
-        # 调度器：每天 UTC 08:30 触发
+        # Pause/resume flag for settlement window
+        self.trading_paused = asyncio.Event()
+        self.trading_paused.set()
+
+        # Scheduler: pause at 07:50 UTC, update+resume at 08:20 UTC
         self.scheduler = AsyncIOScheduler(timezone=timezone("UTC"))
-        self.scheduler.add_job(self._daily_update, 'cron', hour=8, minute=30)
+        self.scheduler.add_job(self._pause_trading, 'cron', hour=7, minute=50)
+        self.scheduler.add_job(self._daily_update, 'cron', hour=8, minute=20)
         self.scheduler.start()
 
+    async def _pause_trading(self):
+        logger.info("⏸️ Pausing trading for settlement (07:50–08:20 UTC)")
+
+        # Cancel all open maker orders to avoid unintended fills
+        async with self._arbs_lock:
+            for _, rec in list(self.active_arbs.items()):
+                oid = rec.get('maker_order_id')
+                if rec.get('status') == 'maker_open' and oid:
+                    rec['status'] = 'active'
+                    rec['maker_order_id'] = None
+
+                    asyncio.create_task(self.cancel_order(oid))
+
+                    logger.info(f"→ Cancelled maker order {oid} due to pause")
+
+        self.trading_paused.clear()
 
     async def _handle_subscription(self, message):
-        """
-        处理三类推送：
-        1) ticker.*
-        2) user.orders.option.<sym>.raw
-        3) user.portfolio.<sym>
-        """
         try:
             channel = message['params']['channel']
-            data    = message['params']['data']
+            data = message['params']['data']
 
-            # ——— 1) TICKER 更新 ———
             if channel.startswith("ticker."):
                 instrument = channel.split('.')[1]
                 for pair in self.pcp_pairs:
@@ -122,84 +136,81 @@ class PCPArbitrage(DeribitClient):
                         await self._update_queue.put(pair)
 
             elif channel.startswith(f"user.orders.option."):
-                # 1) 过滤掉已取消
                 if data.get('order_state') != 'cancelled':
-                    order_id   = data.get('order_id')
+                    order_id = data.get('order_id')
                     filled_amt = data.get('filled_amount', 0.0)
 
                     if filled_amt > 0:
-                        # 2) 在锁内找到对应 rec，算好 diff，并更新状态，但不要 await
                         matched = None
                         async with self._arbs_lock:
                             for _, rec in self.active_arbs.items():
-                                logger.info("finding pairs")
                                 if rec.get('maker_order_id') == order_id:
                                     prev = rec.get('filled_amount', 0)
                                     diff = filled_amt - prev
                                     if diff > 0:
                                         rec['filled_amount'] = filled_amt
                                         matched = (rec, diff)
-                                    break  # 找到就跳出
+                                    break
 
-                        # 3) 锁已释放，真正下 taker 单
                         if matched:
                             rec, diff = matched
-                            await self._place_taker(rec, diff)
-                            logger.info(f"🔄 Placed taker for {order_id}, amount {diff}")
+                            asyncio.create_task(self._place_taker(rec, diff))
+                            logger.info(f"🔄 Scheduled taker for order {rec['maker_order_id']}, amount {diff}")
 
-            # ——— 3) Portfolio 更新 ———
             elif channel.startswith(f"user.portfolio.{self.symbol.lower()}"):
-                init = data['initial_margin']  / data['margin_balance']
+                init = data['initial_margin'] / data['margin_balance']
                 maint = data['maintenance_margin'] / data['margin_balance']
-                # 当任一比率过高，就不允许下 Maker
                 self.allow_maker = not (init > 0.8 or maint > 0.5)
 
                 if maint > 0.5:
                     logger.info(f"🚨 Maintenance margin {maint:.2%} exceeds 50%, cancelling maker orders")
                     async with self._arbs_lock:
                         for _, rec in self.active_arbs.items():
-                            mid = rec.get('maker_order_id')
-                            if mid:
-                                await self.cancel_order(mid)
+                            oid = rec.get('maker_order_id')
+                            if oid:
                                 rec['status'] = 'active'
-
+                                asyncio.create_task(self.cancel_order(oid))
         except Exception as e:
             logger.error(f"_handle_subscription error: {e}")
-
 
     async def _place_taker(self, rec: Dict, amount_diff: float):
         side = rec['maker_side']
         pair = rec['pair']
+        taker_ids = []
 
         if side == 'put':
-            # 对冲买入 call
-            await self.send_order('buy', 'limit', pair.call_instrument, pair.pair_info['call']['ask']['price'], amount_diff)
-            # 对冲卖出 future
-            await self.send_order('sell', 'limit', pair.future_instrument, pair.pair_info['fut']['bid']['price'], amount_diff * pair.pair_info['fut']['bid']['price'])
+            oid1 = await self.send_order('buy', 'limit', pair.call_instrument, pair.pair_info['call']['ask']['price'], amount_diff)
+            taker_ids.append(oid1)
+            oid2 = await self.send_order('sell', 'limit', pair.future_instrument, pair.pair_info['fut']['bid']['price'], amount_diff * pair.pair_info['fut']['bid']['price'])
+            taker_ids.append(oid2)
         else:
-            # 对冲买入 put
-            await self.send_order('buy', 'limit', pair.put_instrument, pair.pair_info['put']['ask']['price'], amount_diff)
-            # 对冲买入 future
-            await self.send_order('buy', 'limit', pair.future_instrument, pair.pair_info['fut']['ask']['price'], amount_diff * pair.pair_info['fut']['ask']['price'])
+            oid1 = await self.send_order('buy', 'limit', pair.put_instrument, pair.pair_info['put']['ask']['price'], amount_diff)
+            taker_ids.append(oid1)
+            oid2 = await self.send_order('buy', 'limit', pair.future_instrument, pair.pair_info['fut']['ask']['price'], amount_diff * pair.pair_info['fut']['ask']['price'])
+            taker_ids.append(oid2)
 
+        now = datetime.now()
+        key = f"{pair.put_instrument}|{pair.call_instrument}|{pair.future_instrument}"
+        async with self._arbs_lock:
+            rec['taker_order_ids'] = taker_ids
+            rec['status'] = 'taker_executed'
+            rec['end_time'] = now
+            self.active_arbs.pop(key, None)
+            self.archived_arbs[key] = rec
+
+        logger.info(f"🏁 Completed taker for {key}: orders={taker_ids}")
 
     def _update_pair_info(self, data: Dict, pair: PCPPair, kind: str) -> bool:
         info = pair.pair_info[kind]
         updated = False
-
-        # Ask 价格更新
         new_ask = data.get('best_ask_price', info['ask']['price'])
         if new_ask != info['ask']['price']:
             info['ask']['price'] = new_ask
             updated = True
-
-        # Bid 价格更新
         new_bid = data.get('best_bid_price', info['bid']['price'])
         if new_bid != info['bid']['price']:
             info['bid']['price'] = new_bid
             updated = True
-
-        # Ask 数量更新
         raw_ask = data.get('best_ask_amount', info['ask']['amount'])
         if raw_ask != info['ask']['amount']:
             if kind == 'fut':
@@ -207,8 +218,6 @@ class PCPArbitrage(DeribitClient):
             else:
                 info['ask']['amount'] = raw_ask
             updated = True
-
-        # Bid 数量更新
         raw_bid = data.get('best_bid_amount', info['bid']['amount'])
         if raw_bid != info['bid']['amount']:
             if kind == 'fut':
@@ -216,19 +225,13 @@ class PCPArbitrage(DeribitClient):
             else:
                 info['bid']['amount'] = raw_bid
             updated = True
-
         return updated
 
-
     async def _monitor_arbitrage_opportunities(self):
-        """
-        Continuously process price updates and detect/close arbitrage opportunities.
-        """
         while not self.exit_event.is_set():
+            await self.trading_paused.wait()
             try:
                 pair = await self._update_queue.get()
-
-                # 跳过数据不完整或已到期的情况
                 required = (
                     pair.pair_info['put']['ask']['price'],
                     pair.pair_info['call']['ask']['price'],
@@ -237,8 +240,6 @@ class PCPArbitrage(DeribitClient):
                 )
                 if None in required or pair.days_to_expiry <= 0:
                     continue
-
-                # 计算套利条件
                 pa, ca = pair.pair_info['put']['ask']['price'], pair.pair_info['call']['ask']['price']
                 fb, fa = pair.pair_info['fut']['bid']['price'], pair.pair_info['fut']['ask']['price']
                 K, d = pair.strike, pair.days_to_expiry
@@ -247,8 +248,6 @@ class PCPArbitrage(DeribitClient):
                 min_c = min(0.0003, ca * 0.125)
                 cond1 = (pa - fee - min_p - min_c - ca - K / fb + 1) / d
                 cond2 = (ca - fee - min_p - min_c - pa - 1 + K / fa) / d
-
-                # 根据较小一侧深度与操作方向
                 if cond1 > cond2:
                     depth = min(pair.pair_info['call']['ask']['amount'] or 0,
                                 pair.pair_info['fut']['bid']['amount'] or 0)
@@ -257,18 +256,12 @@ class PCPArbitrage(DeribitClient):
                     depth = min(pair.pair_info['put']['ask']['amount'] or 0,
                                 pair.pair_info['fut']['ask']['amount'] or 0)
                     maker_side = 'call'
-
                 key = f"{pair.put_instrument}|{pair.call_instrument}|{pair.future_instrument}"
                 threshold = 0.0002
-
-                # 可能需要等待取消的 maker_order_id
                 maker_to_cancel = None
                 now = datetime.now()
-
                 async with self._arbs_lock:
                     rec = self.active_arbs.get(key)
-
-                    # 新机会或更新机会
                     if cond1 > threshold or cond2 > threshold:
                         record = {
                             'pair': pair,
@@ -288,44 +281,31 @@ class PCPArbitrage(DeribitClient):
                                 self._arb_available.set()
                         else:
                             self.active_arbs[key].update(record)
-
-                    # 否则关闭并归档
                     else:
                         if rec:
-                            # 先记下需要取消的 maker_order_id
                             if rec.get('status') == 'maker_open' and rec.get('maker_order_id'):
                                 maker_to_cancel = rec['maker_order_id']
                                 rec['status'] = 'closed'
-
-                            # 归档并移除
                             rec['end_time'] = now
                             self.archived_arbs[key] = rec
                             logger.info(f"❌ Closed arbitrage opportunity: {key}")
                             self.active_arbs.pop(key, None)
-
-                # 锁已经释放，在这里同步等待取消完成
                 if maker_to_cancel:
                     await self.cancel_order(maker_to_cancel)
-
             except Exception as e:
                 logger.error(f"Error in _monitor_arbitrage_opportunities: {e}")
 
-
     async def place_maker_orders(self):
-        """
-        Listen for active_arbs and place/update maker orders accordingly.
-        """
         while not self.exit_event.is_set():
+            await self.trading_paused.wait()
             try:
-                # 等待套利机会触发
                 await self._arb_available.wait()
                 self._arb_available.clear()
+                if not self.trading_paused.is_set():
+                    continue
                 logger.info("🚀 Placing maker orders batch")
-
-                # 拷贝当前 active_arbs 快照
                 async with self._arbs_lock:
                     items = list(self.active_arbs.items())
-
                 for key, rec in items:
                     pair = rec['pair']
                     side = rec['maker_side']
@@ -333,29 +313,24 @@ class PCPArbitrage(DeribitClient):
                     depth = rec['depth']
                     amount = min(depth, 1)
 
-                    # 如果量不足，跳过
+                    # 如果挂单量小于基础挂单量，则跳过
                     if amount < self.base_amount:
                         continue
 
-                    # 在锁内读取状态和现有 order_id
                     async with self._arbs_lock:
                         status = rec.get('status')
                         existing_oid = rec.get('maker_order_id')
 
-                    # 新挂单：仅当状态为 active 且无未完成订单时
+                    # 如果订单状态为 active 且没有 maker 订单，则下 maker 单
                     if status == 'active' and not existing_oid:
                         if not self.allow_maker:
                             continue
-
-                        # 预先标记为正在挂单
+                        
                         async with self._arbs_lock:
                             rec['status'] = 'placing_maker'
 
                         instr = pair.put_instrument if side == 'put' else pair.call_instrument
-                        # 发送挂单请求并等待响应
                         order_id = await self.send_order('sell', 'limit', instr, price, amount)
-
-                        # 在获得响应后更新本地状态
                         async with self._arbs_lock:
                             if order_id:
                                 rec.update({
@@ -366,101 +341,92 @@ class PCPArbitrage(DeribitClient):
                                 })
                                 logger.info(f"→ Placed maker {key} @ {price}")
                             else:
-                                # 挂单失败，重置为 active
                                 rec['status'] = 'active'
                                 logger.error(f"Failed to place maker for {key} @ {price}")
-
-                        # 如果在下单期间机会已消失，则主动取消该单
                         async with self._arbs_lock:
                             still_active = key in self.active_arbs and self.active_arbs[key].get('status') == 'maker_open'
                         if not still_active and order_id:
                             await self.cancel_order(order_id)
                             logger.info(f"→ Cancelled orphan maker {order_id} for expired opportunity {key}")
 
-                    # 修改/替换已有挂单：当价格或数量变化时
+                    # 如果 maker 订单还在，则检查价格和数量是否变化
                     elif status == 'maker_open':
                         old_price = rec.get('maker_price')
                         old_amount = rec.get('maker_amount')
                         maker_id = rec.get('maker_order_id')
-
                         if price != old_price or amount != old_amount:
-                            # 清除本地挂单状态
                             async with self._arbs_lock:
                                 rec['maker_order_id'] = None
                                 rec['status'] = 'active'
-
-                            # 撤单
                             if maker_id:
                                 await self.cancel_order(maker_id)
                                 logger.info(f"→ Cancelled old maker {maker_id} for {key}")
-
-                            # 通知下一轮重挂
                             self._arb_available.set()
 
             except Exception as e:
                 logger.error(f"Error in place_maker_orders: {e}")
-        
 
     async def _daily_update(self):
         now = datetime.now(timezone("UTC"))
         logger.info(f"[DailyUpdate] {now:%Y-%m-%d %H:%M:%S UTC}")
-
         try:
-            # 1) Fetch new PCP pairs
-            new_pairs = await self.get_pcp_pairs(self.symbol)
+            raw_new = await self.get_pcp_pairs(self.symbol)
 
-            new_keys = {
-                f"{p.put_instrument}|{p.call_instrument}|{p.future_instrument}"
-                for p in new_pairs
-            }
+            # map old by key
+            old_map = {f"{p.put_instrument}|{p.call_instrument}|{p.future_instrument}": p for p in self.pcp_pairs}
+            updated = []
+            new_keys = set()
+            for candidate in raw_new:
+                key = f"{candidate.put_instrument}|{candidate.call_instrument}|{candidate.future_instrument}"
+                new_keys.add(key)
+                if key in old_map:
+                    existing = old_map.pop(key)
+                    existing.strike = candidate.strike
+                    existing.expiry = candidate.expiry
+                    updated.append(existing)
+                else:
+                    updated.append(candidate)
 
-            # 2) Archive expired arbitrages
-            expired = []
-            async with self._arbs_lock:
-                for k, rec in list(self.active_arbs.items()):
-                    if k not in new_keys or rec['pair'].days_to_expiry <= 0:
-                        expired.append((k, rec))
-                        self.active_arbs.pop(k, None)
+            # expire old pairs
+            for exp_key, rec in list(self.active_arbs.items()):
+                if exp_key not in new_keys or rec['pair'].days_to_expiry <=0:
+                    oid = rec.get('maker_order_id')
 
-            for k, rec in expired:
-                oid = rec.get('maker_order_id')
-                
-                if rec.get('status') == 'maker_open' and oid:
-                    await self.cancel_order(oid)
+                    if rec.get('status')=='maker_open' and oid:
+                        await self.cancel_order(oid)
 
-                rec['end_time'] = now
-                self.archived_arbs[k] = rec
-                logger.info(f"❌ Archived expired arb {k}")
+                    rec['end_time'] = now
+                    self.archived_arbs[exp_key] = rec
+                    logger.info(f"❌ Archived expired arb {exp_key}")
+                    self.active_arbs.pop(exp_key, None)
 
-            # 3) Update the pcp_pairs list to the new set
-            self.pcp_pairs = new_pairs
+            self.pcp_pairs = updated
 
-            # 4) Build new subscription set
-            new_subs: Set[str] = {f"user.orders.option.{self.symbol.lower()}.raw", f"user.portfolio.{self.symbol.lower()}"}
-            for pair in self.pcp_pairs:
-                new_subs.add(f"ticker.{pair.put_instrument}.raw")
-                new_subs.add(f"ticker.{pair.call_instrument}.raw")
-                new_subs.add(f"ticker.{pair.future_instrument}.raw")
+            # subscription diff
+            subs = {f"user.orders.option.{self.symbol.lower()}.raw", f"user.portfolio.{self.symbol.lower()}"}
+            for p in self.pcp_pairs:
+                subs.update({f"ticker.{p.put_instrument}.raw", f"ticker.{p.call_instrument}.raw", f"ticker.{p.future_instrument}.raw"})
 
-            # 5) Unsubscribe and subscribe diffs
-            to_unsub = list(self.subscribed_instruments - new_subs)
-            to_sub = list(new_subs - self.subscribed_instruments)
+            to_unsub = list(self.subscribed_instruments - subs)
+            to_sub   = list(subs - self.subscribed_instruments)
+
             if to_unsub:
                 await self.unsubscribe(to_unsub)
                 logger.info(f"→ Unsubscribed {to_unsub}")
             if to_sub:
                 await self.subscribe(to_sub)
-                logger.info(f"→ Subscribed {to_sub}")
+                logger.info(f"→ Subscribed   {to_sub}")
 
-            # 6) Save new subscriptions
-            self.subscribed_instruments = new_subs
+            self.subscribed_instruments = subs
 
-            # 7) Clear any pending updates in queue
             while not self._update_queue.empty():
                 self._update_queue.get_nowait()
 
         except Exception as e:
             logger.error(f"DailyUpdate error: {e}")
+        finally:
+            self.trading_paused.set()
+            logger.info("▶️ Trading resumed after daily update")
 
 
     async def get_options(self, currency: str) -> Dict[str, Dict]:
